@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# audiofix — show audio status, then fix the default sink (USB Audio Device)
+#
+# Usage:
+#   audiofix           show status, then prompt to fix if it's wrong
+#   audiofix status    show status only
+#   audiofix fix       apply the fix (no prompt)
+#   audiofix test      play a 1s test tone through the default sink
+#   audiofix help      this help
+#
+# The real output device is the C-Media USB Audio Device:
+#   alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo
+# Root cause of recurring breakage: WirePlumber's boot race picks
+# Loopback / S/PDIF / HDMI as default (first available at priority 1009 wins).
+
+USB_SINK="alsa_output.usb-C-Media_Electronics_Inc._USB_Audio_Device-00.analog-stereo"
+USB_LABEL="USB Audio Device Analog Stereo"
+
+GREEN=$'\033[32m'; RED=$'\033[31m'; YELLOW=$'\033[33m'; CYAN=$'\033[36m'
+BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+
+need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required tool: $1" >&2; exit 1; }; }
+
+# ---------------------------------------------------------------- status
+status() {
+    echo "${BOLD}── Audio status ────────────────────────────────────────────${RESET}"
+
+    local default_sink=""
+    default_sink="$(wpctl status 2>/dev/null | awk '/Sinks:/{f=1;next} f&&/^ *\*/{gsub(/^ *\* +/,""); sub(/ .*\[vol.*/,""); print; exit}')"
+    [ -z "$default_sink" ] && default_sink="$(pactl get-default-sink 2>/dev/null)"
+
+    local usb_present=0 usb_is_default=0
+    if pactl list sinks short 2>/dev/null | grep -q "$USB_SINK"; then
+        usb_present=1
+        [ "$default_sink" = "$USB_SINK" ] && usb_is_default=1
+    fi
+
+    echo
+    echo "${BOLD}Sinks:${RESET}"
+    pactl list sinks short 2>/dev/null | while read -r id name _rest; do
+        local mark="" 
+        [ "$name" = "$USB_SINK" ] && mark="${CYAN}◀ USB (real output)${RESET}"
+        if [ "$name" = "$default_sink" ]; then
+            printf '  %s  %-70s %s\n' "*" "$name" "$mark"
+        else
+            printf '  %s  %-70s %s\n' " " "$name" "$mark"
+        fi
+    done
+    [ "$(pactl list sinks short 2>/dev/null | wc -l)" -eq 0 ] && echo "  (no sinks — PipeWire down?)"
+
+    echo
+    echo "${BOLD}Persisted vs live default:${RESET}"
+    local live=""
+    live="$(pw-metadata 2>/dev/null | grep "key:'default.audio.sink'" | head -1 | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    local configured=""
+    configured="$(pw-metadata -n default 0 2>/dev/null | grep "default.configured.audio.sink" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+    printf '  live       : %s\n' "${live:-<unset>}"
+    printf '  configured : %s\n' "${configured:-<unset>}"
+
+    echo
+    echo "${BOLD}Active streams:${RESET}"
+    local n=0
+    while read -r id sink rest; do
+        [ -z "$id" ] && continue
+        sinkname="$(pactl list sinks short 2>/dev/null | awk -v s="$sink" '$1==s{print $2}')"
+        if [ "$sinkname" = "$USB_SINK" ]; then
+            printf "  stream %s → %s %b✓%b\n" "$id" "$sinkname" "$GREEN" "$RESET"
+        else
+            printf "  stream %s → %s %b✗%b\n" "$id" "${sinkname:-sink $sink}" "$RED" "$RESET"
+        fi
+        n=$((n+1))
+    done < <(pactl list sink-inputs short 2>/dev/null)
+    [ "$n" -eq 0 ] && echo "  (none playing)"
+
+    # motherboard analog availability (matters when USB is unplugged)
+    local alc_ok=0
+    if pactl list cards 2>/dev/null | grep -A20 'alsa_card.pci-0000_07_00.6' | grep -q 'output:analog-stereo.*yes'; then
+        alc_ok=1
+    fi
+
+    echo
+    if [ "$usb_present" -eq 1 ] && [ "$usb_is_default" -eq 1 ]; then
+        echo "${GREEN}${BOLD}✓ Status OK — USB Audio Device is the default.${RESET}"
+    elif [ "$usb_present" -eq 1 ]; then
+        echo "${RED}${BOLD}✗ Broken — USB device exists but default is: ${default_sink:-<none>}${RESET}"
+    elif [ "$alc_ok" -eq 1 ]; then
+        echo "${YELLOW}${BOLD}! USB device not connected — falling back to motherboard analog (available).${RESET}"
+    else
+        echo "${RED}${BOLD}✗ USB not connected AND motherboard analog profile unavailable (jack-detect bug) — likely no sound at all.${RESET}"
+        echo "  The force-analog fix file should handle this at boot:"
+        ls -l ~/.config/wireplumber/wireplumber.conf.d/51-force-analog-alc897.conf 2>/dev/null \
+            || echo "  ${RED}MISSING: 51-force-analog-alc897.conf — recreate it (see memory/notes).${RESET}"
+    fi
+    echo
+}
+
+# ------------------------------------------------------------------ fix
+fix() {
+    local default_sink
+    default_sink="$(pactl get-default-sink 2>/dev/null)"
+
+    if ! pactl list sinks short 2>/dev/null | grep -q "$USB_SINK"; then
+        echo "${RED}USB Audio Device sink not present — is it plugged in?${RESET}" >&2
+        echo "If it's plugged in, try: systemctl --user restart wireplumber" >&2
+        return 1
+    fi
+
+    if [ "$default_sink" = "$USB_SINK" ]; then
+        echo "${GREEN}Default is already correct (${USB_LABEL}).${RESET}"
+    else
+        echo "Setting default sink → ${USB_LABEL}..."
+        pactl set-default-sink "$USB_SINK" && echo "${GREEN}  pactl set-default-sink: ok${RESET}"
+    fi
+
+    # persist the preference in WirePlumber state so a restart keeps it
+    local live
+    live="$(pw-metadata 2>/dev/null | grep "key:'default.audio.sink'" | head -1 | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    if [ "$live" != "$USB_SINK" ]; then
+        echo "Updating live WirePlumber metadata..."
+        pw-metadata -n default 0 default.audio.sink "{\"name\":\"$USB_SINK\"}" \
+            && echo "${GREEN}  pw-metadata: ok${RESET}"
+    fi
+
+    # move any playing streams to the USB sink
+    local moved=0
+    while read -r id sink _rest; do
+        [ -z "$id" ] && continue
+        if [ "$(pactl list sinks short 2>/dev/null | awk -v s="$sink" '$1==s{print $2}')" != "$USB_SINK" ]; then
+            pactl move-sink-input "$id" "$USB_SINK" 2>/dev/null && { echo "  moved stream $id → USB"; moved=$((moved+1)); }
+        fi
+    done < <(pactl list sink-inputs short 2>/dev/null)
+    [ "$moved" -eq 0 ] && echo "  (no streams needed moving)"
+
+    # confirm
+    local now
+    now="$(pactl get-default-sink 2>/dev/null)"
+    if [ "$now" = "$USB_SINK" ]; then
+        echo
+        echo "${GREEN}${BOLD}✓ Fixed — default is now ${USB_LABEL}.${RESET}"
+        return 0
+    else
+        echo
+        echo "${RED}✗ Still not default (now: ${now:-<none>}). Try: systemctl --user restart wireplumber${RESET}" >&2
+        return 1
+    fi
+}
+
+# ----------------------------------------------------------------- test
+test_tone() {
+    need ffmpeg; need paplay
+    local sink="${1:-$(pactl get-default-sink 2>/dev/null)}"
+    [ -z "$sink" ] && { echo "${RED}no default sink${RESET}" >&2; return 1; }
+    echo "Playing 1s test tone (880 Hz) through: $sink"
+    if ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=frequency=880:duration=1" -ar 48000 -ac 2 -y /tmp/.audiofix-test.wav; then
+        paplay --device="$sink" /tmp/.audiofix-test.wav && rm -f /tmp/.audiofix-test.wav
+    fi
+}
+
+# ---------------------------------------------------------------- main
+need pactl; need wpctl; need pw-metadata
+
+case "${1:-}" in
+    status)  status ;;
+    fix)     status; fix ;;
+    test)    test_tone ;;
+    help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+    "")
+        status
+        # decide whether a fix is warranted
+        usb_present=0; usb_default=0; default_sink=""
+        default_sink="$(pactl get-default-sink 2>/dev/null)"
+        pactl list sinks short 2>/dev/null | grep -q "$USB_SINK" && usb_present=1
+        [ "$default_sink" = "$USB_SINK" ] && usb_default=1
+
+        if [ "$usb_present" -eq 1 ] && [ "$usb_default" -eq 1 ]; then
+            echo "${GREEN}Nothing to fix. Run 'audiofix test' to hear a tone, 'audiofix fix' to force re-apply.${RESET}"
+        else
+            printf "%s" "Apply fix now? [y/N] "
+            read -r ans
+            case "$ans" in
+                y|Y|yes|YES) fix ;;
+                *) echo "OK, leaving it. Run 'audiofix fix' when you want it applied." ;;
+            esac
+        fi
+        ;;
+    *) echo "unknown arg: $1  (try: audiofix status | fix | test | help)" >&2; exit 1 ;;
+esac

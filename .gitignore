@@ -1,0 +1,71 @@
+# ArchUtils — root .gitignore
+# Covers every tool in the monorepo. Per-tool .gitignore files may add more.
+
+# ─── Local config & credentials ────────────────────────────────────────────
+# .env holds machine-specific paths on every tool; .env.example stays tracked.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa*
+known_hosts
+# Never commit a browser session export — these are full account tokens.
+cookies.txt
+cookies*.txt
+*.cookies.txt
+
+# ─── Jackdaw: runtime state ────────────────────────────────────────────────
+# Maps profile names to wallpaper filenames; identifies the machine and the
+# user's image set. Regenerated on first run.
+wallpaper.json
+wallpaper.json.lock
+*.tmp
+
+# ─── IDM: run artifacts ────────────────────────────────────────────────────
+# yt-dlp's per-folder download archive records every URL ever fetched, and
+# aria2c leaves .aria2 control files next to partial downloads.
+.idm_archive*
+*.aria2
+.downloaded/
+
+# ─── Vox: encoder output ───────────────────────────────────────────────────
+# Vox writes converted media into the folder it was run from.
+Vox Output/
+
+# ─── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+*.egg
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+
+# ─── Logs, temp & editor backups ───────────────────────────────────────────
+*.log
+*.bak
+*.orig
+*~
+*.swp
+*.swo
+
+# ─── OS & editor cruft ─────────────────────────────────────────────────────
+.DS_Store
+._*
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.sublime-workspace

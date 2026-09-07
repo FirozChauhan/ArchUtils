@@ -1,0 +1,1 @@
+# Wither uses only the Python standard library — no external dependencies.
