@@ -10,7 +10,9 @@ files, permission problems, a failing setter) and simply advances to the
 next wallpaper.
 
 Configuration comes from a .env file next to this script and/or real
-environment variables (env vars win). See .env.example.
+environment variables (env vars win). See .env.example. The setter is
+hyprpaper, applied via 'hyprctl hyprpaper wallpaper' (a running Hyprland
+session with autostarted 'hyprpaper' is required).
 
 Usage:
   Jackdaw.py <profile>             run the daemon (cycle every DELAY_SECONDS)
@@ -22,6 +24,7 @@ Usage:
 
 import argparse
 import fcntl
+import glob
 import json
 import logging
 import os
@@ -38,9 +41,8 @@ SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 DEFAULTS = {
     "WALLPAPERS_ROOT": os.path.expanduser("~/Pictures/wallpapers"),
     "DB_PATH": os.path.join(SCRIPT_DIR, "wallpaper.json"),
-    "SETTER": "awww",
     "DELAY_SECONDS": "3600",
-    "IMAGE_EXTENSIONS": ".avif,.png,.jpg,.jpeg,.webp,.gif,.bmp,.tiff,.tif,.jxl",
+    "IMAGE_EXTENSIONS": ".png,.jpg,.jpeg,.webp,.jxl",
 }
 
 log = logging.getLogger("jackdaw")
@@ -74,7 +76,6 @@ WALLPAPERS_ROOT = ENV["WALLPAPERS_ROOT"]
 DB_PATH = ENV["DB_PATH"]
 if not os.path.isabs(DB_PATH):
     DB_PATH = os.path.join(SCRIPT_DIR, DB_PATH)
-SETTER = ENV["SETTER"]
 DEFAULT_DELAY = int(ENV["DELAY_SECONDS"])
 IMAGE_EXTS = {
     e.strip().lower() if e.strip().startswith(".") else "." + e.strip().lower()
@@ -174,26 +175,52 @@ def last_index(stored, walls):
         return -1
 
 
+def hyprpaper_running():
+    """True if a hyprpaper IPC socket exists for the current Hyprland session.
+
+    hyprpaper >= 0.8 exposes a hidden hyprwire socket named
+    '.hyprpaper.sock' under $XDG_RUNTIME_DIR/hypr/<signature>/ (older
+    releases used a visible 'hyprpaper.sock'); either one counts.
+    """
+    sig = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    if not sig:
+        return False
+    base = os.path.join(runtime, "hypr", sig)
+    return bool(glob.glob(os.path.join(base, ".hyprpaper.sock"))
+                or glob.glob(os.path.join(base, "hyprpaper.sock")))
+
+
 def set_wallpaper(folder, name):
-    """Apply a wallpaper without a shell. Returns True on success."""
+    """Apply a wallpaper to every monitor via 'hyprctl hyprpaper'.
+
+    hyprpaper 0.8 speaks a binary protocol, so the supported way to poke
+    it is hyprctl's hyprpaper subcommand: arguments are comma-separated
+    [mon],[path],[fit_mode]. An *empty* monitor field is the all-monitors
+    wildcard ('*' is rejected as an invalid monitor name by 0.8.4's IPC
+    validator). hyprctl exits non-zero and prints 'error: ...' on any
+    failure, and images are reference-counted inside hyprpaper, so there
+    is no preload/unload bookkeeping to do here. Returns True on success.
+    """
     path = os.path.join(folder, name)
     try:
         result = subprocess.run(
-            [SETTER, "img", path, "--transition-type", "none"],
+            ["hyprctl", "hyprpaper", "wallpaper", f",{path}"],
             capture_output=True,
             text=True,
             timeout=30,
         )
     except FileNotFoundError:
-        log.error("'%s' disappeared from PATH - reinstall it and restart Jackdaw", SETTER)
+        log.error("'hyprctl' disappeared from PATH - install hyprland and restart Jackdaw")
         return False
     except subprocess.TimeoutExpired:
-        log.error("%s timed out applying %s", SETTER, name)
+        log.error("hyprctl timed out applying %s", name)
         return False
     if result.returncode != 0:
-        # e.g. setter daemon not running, or the file was deleted mid-cycle
-        log.error("%s failed (%s): %s", SETTER, result.returncode,
-                  result.stderr.strip() or name)
+        # e.g. hyprpaper died, or the file vanished between scan and apply
+        detail = (result.stdout + result.stderr).strip()
+        log.error("hyprpaper failed (%s): %s", result.returncode,
+                  detail or "no wallpaper IPC response - is hyprpaper running?")
         return False
     return True
 
@@ -231,8 +258,10 @@ def pick_next(profile, walls, failed=frozenset()):
 
 
 def require_setter():
-    if shutil.which(SETTER) is None:
-        sys.exit(f"'{SETTER}' not found in PATH - install it or set SETTER in .env")
+    if shutil.which("hyprctl") is None:
+        sys.exit("'hyprctl' not found in PATH - Jackdaw applies wallpapers via 'hyprctl hyprpaper'")
+    if not hyprpaper_running():
+        sys.exit("hyprpaper is not running (no .hyprpaper.sock IPC socket) - start it or log in again")
 
 
 def resolve_folder(profile):
@@ -255,7 +284,7 @@ def cmd_once(folder, profile):
             print(f"[{profile}] -> {name}")
             return
         failed.add(name)  # broken image must not block cron - try the next one
-    sys.exit(f"{SETTER} failed to apply every wallpaper in {folder}")
+    sys.exit(f"hyprpaper failed to apply every wallpaper in {folder}")
 
 
 def cmd_set(folder, profile, value):
@@ -268,7 +297,7 @@ def cmd_set(folder, profile, value):
         sys.exit(f"No such file: {path}")
     name = os.path.basename(path)
     if not set_wallpaper(folder, name):
-        sys.exit(f"{SETTER} failed to apply {name}")
+        sys.exit(f"hyprpaper failed to apply {name}")
     merge_save(profile, name)
     print(f"[{profile}] set -> {name}")
 
@@ -278,7 +307,7 @@ def cmd_status(folder, profile):
     current = load_state().get(profile)
     print(f"profile:  {profile}")
     print(f"folder:   {folder}")
-    print(f"setter:   {SETTER}")
+    print("setter:   hyprpaper (hyprctl hyprpaper wallpaper ,<path>)")
     print(f"interval: {DEFAULT_DELAY}s")
     print(f"state:    {DB_PATH}")
     print(f"images:   {len(walls)}")
@@ -304,7 +333,7 @@ def cmd_list(folder, profile):
 def cmd_daemon(folder, profile):
     require_setter()
     signal.signal(signal.SIGTERM, _term)
-    log.info("watching %s every %ss via '%s'", folder, DEFAULT_DELAY, SETTER)
+    log.info("watching %s every %ss via hyprpaper", folder, DEFAULT_DELAY)
 
     failed = set()  # names that failed to apply since the last success
 

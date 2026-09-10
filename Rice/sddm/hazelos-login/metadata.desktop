@@ -1,0 +1,11 @@
+[SddmGreeterTheme]
+Name=hazelos-login
+Description=Black void. One line. Your password.
+Author=asrar
+License=MIT
+Type=sddm-theme
+Version=0.1
+MainScript=Main.qml
+ConfigFile=theme.conf
+Theme-API=2.0
+QtVersion=6
