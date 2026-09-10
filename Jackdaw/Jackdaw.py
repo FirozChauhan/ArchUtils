@@ -18,6 +18,9 @@ Usage:
   Jackdaw.py <profile>             run the daemon (cycle every DELAY_SECONDS)
   Jackdaw.py <profile> --once      apply the next wallpaper and exit
   Jackdaw.py <profile> --set FILE  apply one specific wallpaper and exit
+  Jackdaw.py [profile] --restore   re-apply the current wallpaper and exit
+                                   (no rotation; boot use; skips the profile
+                                   arg and uses the last-used one)
   Jackdaw.py <profile> --status    show current/next wallpaper and config
   Jackdaw.py <profile> --list      list the rotation, newest first
 """
@@ -43,7 +46,12 @@ DEFAULTS = {
     "DB_PATH": os.path.join(SCRIPT_DIR, "wallpaper.json"),
     "DELAY_SECONDS": "3600",
     "IMAGE_EXTENSIONS": ".png,.jpg,.jpeg,.webp,.jxl",
+    "RESTORE_WAIT_SECONDS": "20",
 }
+
+# Reserved state key (never a real folder name) holding the last profile that
+# applied a wallpaper, so --restore can rebuild the boot screen on its own.
+LAST_KEY = "_last"
 
 log = logging.getLogger("jackdaw")
 
@@ -113,13 +121,15 @@ def merge_save(profile, name):
     """Reload state under an exclusive lock, update only our profile key, save.
 
     Multiple daemons (one per profile) run concurrently; the lock plus the
-    fresh read means we never clobber another profile's newer entry.
+    fresh read means we never clobber another profile's newer entry. Also
+    records which profile applied last, for --restore at boot.
     """
     with open(DB_PATH + ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             state = load_state()
             state[profile] = name
+            state[LAST_KEY] = profile
             save_state(state)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
@@ -264,6 +274,17 @@ def require_setter():
         sys.exit("hyprpaper is not running (no .hyprpaper.sock IPC socket) - start it or log in again")
 
 
+def wait_for_hyprpaper(timeout):
+    """Poll until hyprpaper's IPC socket appears (used by --restore at boot,
+    where Jackdaw runs the same instant autostart spawns hyprpaper)."""
+    deadline = _now() + timeout
+    while not hyprpaper_running():
+        if _now() >= deadline:
+            return False
+        time.sleep(0.3)
+    return True
+
+
 def resolve_folder(profile):
     folder = os.path.join(WALLPAPERS_ROOT, profile)
     if not os.path.isdir(folder):
@@ -300,6 +321,30 @@ def cmd_set(folder, profile, value):
         sys.exit(f"hyprpaper failed to apply {name}")
     merge_save(profile, name)
     print(f"[{profile}] set -> {name}")
+
+
+def cmd_restore(folder, profile):
+    """Apply the profile's CURRENT wallpaper without advancing the rotation.
+
+    Boot helper: hyprpaper starts empty (Jackdaw drives it over IPC, so
+    hyprpaper.conf has no static wallpaper lines), which left a black screen
+    until a hotkey press. This re-applies what wallpaper.json says is shown.
+    Waits for hyprpaper's socket instead of failing fast, because it is meant
+    to run right next to the autostart 'hyprpaper' line."""
+    if shutil.which("hyprctl") is None:
+        sys.exit("'hyprctl' not found in PATH - Jackdaw applies wallpapers via 'hyprctl hyprpaper'")
+    if not wait_for_hyprpaper(int(ENV["RESTORE_WAIT_SECONDS"])):
+        sys.exit("hyprpaper did not start in time (no .hyprpaper.sock IPC socket)")
+    walls = scan_wallpapers(folder)
+    if not walls:
+        sys.exit(f"No wallpapers in {folder}")
+    name = load_state().get(profile)
+    if name not in walls:
+        name = walls[0]  # remembered wallpaper was deleted/moved - newest wins
+    if not set_wallpaper(folder, name):
+        sys.exit(f"hyprpaper failed to apply {name}")
+    merge_save(profile, name)
+    print(f"[{profile}] restored -> {name}")
 
 
 def cmd_status(folder, profile):
@@ -371,30 +416,56 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="Jackdaw.py", description="Wallpaper daemon: one folder per profile.")
-    parser.add_argument("profile", help="name of the profile folder under WALLPAPERS_ROOT")
+    parser.add_argument("profile", nargs="?",
+                        help="name of the profile folder under WALLPAPERS_ROOT "
+                             "(optional with --restore: uses the last-used profile)")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--once", action="store_true",
                        help="apply the next wallpaper and exit (for cron/timers)")
     group.add_argument("--set", metavar="FILE",
                        help="apply one specific wallpaper from the profile folder and exit")
+    group.add_argument("--restore", action="store_true",
+                       help="re-apply the current wallpaper (no rotation) and exit")
     group.add_argument("--status", action="store_true",
                        help="show current/next wallpaper and effective config")
     group.add_argument("--list", action="store_true",
                        help="list wallpapers in rotation order (newest first)")
     args = parser.parse_args()
 
-    folder = resolve_folder(args.profile)
+    profile = args.profile
+    if args.restore and profile is None:
+        # Boot restore without a profile: show what was on screen when the
+        # session last ended. State files predating '_last' fall back to the
+        # first profile key, so the very first boot still succeeds quietly
+        # (and merge_save records '_last' from there on).
+        state = load_state()
+        candidates = [state.get(LAST_KEY)] + [
+            k for k in state if k != LAST_KEY
+        ]
+        profile = next(
+            (c for c in candidates
+             if c and os.path.isdir(os.path.join(WALLPAPERS_ROOT, c))),
+            None,
+        )
+        if not profile:
+            sys.exit("--restore needs a profile (no usable profiles in "
+                     f"{DB_PATH}; pass <profile> explicitly)")
+    if profile is None:
+        parser.error("the 'profile' argument is required")
+    folder = resolve_folder(profile)
 
     if args.once:
-        cmd_once(folder, args.profile)
+        cmd_once(folder, profile)
     elif args.set:
-        cmd_set(folder, args.profile, args.set)
+        cmd_set(folder, profile, args.set)
+    elif args.restore:
+        cmd_restore(folder, profile)
     elif args.status:
-        cmd_status(folder, args.profile)
+        cmd_status(folder, profile)
     elif args.list:
-        cmd_list(folder, args.profile)
+        cmd_list(folder, profile)
     else:
-        cmd_daemon(folder, args.profile)
+        cmd_daemon(folder, profile)
 
 
 if __name__ == "__main__":
