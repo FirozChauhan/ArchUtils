@@ -1,0 +1,9 @@
+#compdef tdm
+# tdm zsh completion (generated at build via shtab)
+_arguments \
+    '(-o --output)'{-o,--output}'[output file]:file:_files' \
+    '(-d --dest)'{-d,--dest}'[dest dir]:dir:_dirs' \
+    '(-x --max-connections)'{-x,--max-connections}'[connections]:n:' \
+    '--dry-run[probe only]' \
+    '--json[machine output]' \
+    '*:url:_urls'

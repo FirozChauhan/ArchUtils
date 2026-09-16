@@ -61,6 +61,10 @@ dist/
 *.swp
 *.swo
 
+# ─── Serena agent state ────────────────────────────────────────────────────
+# Local cache, memories and machine-specific project config. Regenerated.
+.serena/
+
 # ─── OS & editor cruft ─────────────────────────────────────────────────────
 .DS_Store
 ._*

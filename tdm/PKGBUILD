@@ -1,0 +1,35 @@
+# PKGBUILD for Arch Linux (stable repo deps, no pip in package())
+pkgname=tdm
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Robust CLI download manager with browser impersonation"
+arch=('any')
+url="https://github.com/hazelos/tdm"
+license=('MIT')
+depends=('python' 'python-curl_cffi' 'python-rich' 'python-platformdirs' 'yt-dlp')
+makedepends=('python-build' 'python-installer' 'python-hatchling' 'scdoc' 'python-shtab')
+optdepends=('libnotify: desktop notifications'
+            'ffmpeg: HLS/DASH merge via yt-dlp'
+            'bash-completion: bash completion'
+            'zsh: zsh completion'
+            'fish: fish completion')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/hazelos/$pkgname/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  python -m build --wheel --no-isolation
+  scdoc < man/tdm.1.scd > man/tdm.1
+  python -m shtab --shell=bash src.tdm.cli --prog tdm > completions/tdm.bash || true
+  python -m shtab --shell=zsh src.tdm.cli --prog tdm > completions/_tdm || true
+  python -m shtab --shell=fish src.tdm.cli --prog tdm > completions/tdm.fish || true
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+  python -m installer --destdir="$pkgdir" dist/*.whl
+  install -Dm644 man/tdm.1 "$pkgdir/usr/share/man/man1/tdm.1"
+  install -Dm644 completions/tdm.bash "$pkgdir/usr/share/bash-completion/completions/tdm"
+  install -Dm644 completions/_tdm "$pkgdir/usr/share/zsh/site-functions/_tdm"
+  install -Dm644 completions/tdm.fish "$pkgdir/usr/share/fish/vendor_completions.d/tdm.fish"
+}

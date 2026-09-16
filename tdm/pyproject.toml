@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tdm"
+version = "0.1.0"
+description = "Robust CLI download manager with browser impersonation for Arch Linux"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "tdm" }]
+dependencies = [
+  "curl-cffi>=0.11",
+  "rich>=13",
+  "platformdirs>=4",
+  "yt-dlp>=2024.1",
+]
+optional-dependencies = { test = ["pytest>=8"] }
+
+[project.scripts]
+tdm = "tdm.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tdm"]
+
+[tool.ruff]
+line-length = 100

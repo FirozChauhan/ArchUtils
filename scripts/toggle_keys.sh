@@ -74,7 +74,7 @@ enable_hotkeys() {
     done
     lu "hl.unbind(\"$SHOT_KEY\")"
     lu "hl.bind(\"$SHOT_KEY\", hl.dsp.exec_cmd(\"$SHOT_CMD\"))"
-    notify-send "Hotkeys ENABLED"
+    hyprctl notify 5 1500 0 "text: Hotkeys ENABLED"
 }
 
 # Strip the binds from the live config (exact mod-combo match: plain "1"
@@ -85,7 +85,7 @@ disable_hotkeys() {
         lu "hl.unbind(\"$k\")"
     done
     lu "hl.unbind(\"$SHOT_KEY\")"
-    notify-send "Hotkeys DISABLED"
+    hyprctl notify 0 1500 0 "text: Hotkeys DISABLED"
 }
 
 #-------------------------------------------------------------------------------

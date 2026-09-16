@@ -6,8 +6,11 @@
 #   ~/.pi/agent/memory/SCRATCHPAD.md      (scratchpad items)
 #   ~/.pi/agent/memory/daily/*.md         (daily session logs)
 #   ~/.pi/agent/memory/recovery/*.json    (memory_forget undo records)
+#   ~/.pi/agent/sessions/**/*.jsonl       (pi session/transcript logs)
 #   ~/.cache/qmd/index.sqlite             (semantic/deep search index)
-#   ~/.pi/agent/self/{notes,checkpoints}.jsonl, phoenix.log  (self-extension stores)
+#   ~/.pi/agent/self/{notes,checkpoints}.jsonl  (self-extension stores)
+#   ~/.pi/agent/self/phoenix.log                 (phoenix auto-continue log)
+#   ~/.pi/agent/**/phoenix.log                   (any other phoenix logs)
 #
 # Keeps the files/dirs themselves so the memory system still works (empty slate),
 # and leaves pi config untouched (auth.json, settings.json, models.json, extensions).
@@ -17,6 +20,7 @@ set -u
 
 MEM="$HOME/.pi/agent/memory"
 SELF="$HOME/.pi/agent/self"
+SESSIONS="$HOME/.pi/agent/sessions"
 QMD_IDX="$HOME/.cache/qmd/index.sqlite"
 
 fail=0
@@ -31,13 +35,22 @@ rm -f "$MEM"/daily/*.md 2>/dev/null
 # --- recovery records ---
 rm -f "$MEM"/recovery/*.json 2>/dev/null
 
+# --- pi session logs (transcripts) ---
+# remove every session .jsonl and the per-project slug dirs, keep sessions/ itself
+find "$SESSIONS" -mindepth 1 -type f -name '*.jsonl' -delete 2>/dev/null
+find "$SESSIONS" -mindepth 1 -type d -empty -delete 2>/dev/null
+
 # --- qmd search index (indexes all memory content) ---
 rm -f "$QMD_IDX" 2>/dev/null
 
 # --- self-extension data stores (truncate, keep config phoenix.json) ---
 : > "$SELF/notes.jsonl"      2>/dev/null || { echo "FAIL: $SELF/notes.jsonl"; fail=1; }
 : > "$SELF/checkpoints.jsonl" 2>/dev/null || { echo "FAIL: $SELF/checkpoints.jsonl"; fail=1; }
-: > "$SELF/phoenix.log"       2>/dev/null || { echo "FAIL: $SELF/phoenix.log"; fail=1; }
+
+# --- phoenix logs (truncate the main one, remove any others) ---
+: > "$SELF/phoenix.log" 2>/dev/null || { echo "FAIL: $SELF/phoenix.log"; fail=1; }
+find "$HOME/.pi/agent" -mindepth 1 -type f -name 'phoenix.log' -not -path "$SELF/phoenix.log" -delete 2>/dev/null
+find "$HOME/.pi" -mindepth 1 -type f \( -name '*phoenix*.log' -o -name 'phoenix*.jsonl' \) -delete 2>/dev/null
 
 if (( fail )); then
   echo "pi-forget: finished with errors (see above)."
@@ -49,5 +62,7 @@ echo "  MEMORY.md:      $(wc -c < "$MEM/MEMORY.md") bytes"
 echo "  SCRATCHPAD.md:  $(wc -c < "$MEM/SCRATCHPAD.md") bytes"
 echo "  daily logs:     $(ls "$MEM/daily" 2>/dev/null | wc -l)"
 echo "  recovery:       $(ls "$MEM/recovery" 2>/dev/null | wc -l)"
+echo "  session logs:   $(find "$SESSIONS" -type f -name '*.jsonl' 2>/dev/null | wc -l)"
 echo "  qmd index:      $([ -f "$QMD_IDX" ] && echo present || echo removed)"
-echo "  self notes/ckpt/phoenix.log: $(wc -c < "$SELF/notes.jsonl")/$(wc -c < "$SELF/checkpoints.jsonl")/$(wc -c < "$SELF/phoenix.log") bytes"
+echo "  self notes/ckpt:  $(wc -c < "$SELF/notes.jsonl")/$(wc -c < "$SELF/checkpoints.jsonl") bytes"
+echo "  phoenix.log:      $(wc -c < "$SELF/phoenix.log" 2>/dev/null || echo 0) bytes"

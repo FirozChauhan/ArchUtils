@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+dist/
+build/
+*.egg-info/
+src/*.egg-info/
+.venv/
+.pytest_cache/
+
+# runtime artifacts — never commit
+*.part
+*.part.json
+*cookies*.txt
+cookies.txt
+*.log

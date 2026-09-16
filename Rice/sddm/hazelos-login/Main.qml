@@ -19,7 +19,7 @@
  *    • A visible:false or zero-size ListView never instantiates delegates.
  */
 
-import QtQuick
+import QtQuick 2.15
 
 Rectangle {
     id: root

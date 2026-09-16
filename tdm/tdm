@@ -1,0 +1,11 @@
+#!/bin/sh
+# tdm launcher — no venv needed, uses system python + system deps.
+# Resolves project dir from symlink location.
+BIN="$(readlink -f "$0")"
+ROOT="$(dirname "$BIN")"
+# if installed as symlink (e.g. ~/.local/bin/tdm -> .../tdm/tdm), ROOT is project dir
+if [ ! -d "$ROOT/src/tdm" ]; then
+  # fallback: fixed project location
+  ROOT="/home/asrar/code/production/tools/hazelos/tdm"
+fi
+exec python3 -c "import sys; sys.path.insert(0, '$ROOT/src'); from tdm.cli import main; raise SystemExit(main())" "$@"
