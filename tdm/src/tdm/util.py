@@ -1,6 +1,7 @@
 """Shared helpers: sizes, filenames, retry-after, notify, disk, fallocate."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import os
 import posixpath
@@ -12,7 +13,7 @@ from datetime import datetime, timezone
 from email.message import Message
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qsl, unquote, urlparse
 
 SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:[iI]?[bB])?\s*$")
 
@@ -63,8 +64,30 @@ def filename_from_cd(cd: str | None, url: str) -> str | None:
                 return sanitize_filename(unquote(fn))
         except Exception:
             pass
-    # fallback: URL basename
+    # fallback 1: URL path basename (e.g. /videos/clip.mp4)
     try:
+        path = urlparse(url).path
+        base = posixpath.basename(path.rstrip("/"))
+        if base and "." in base and not base.endswith(".php"):
+            return sanitize_filename(unquote(base))
+    except Exception:
+        pass
+    # fallback 2: script endpoints like remote_control.php?file=<name>.mp4
+    # carry the real filename in a query param; prefer values with an extension.
+    try:
+        for _, val in parse_qsl(urlparse(url).query, keep_blank_values=True):
+            v = unquote(val).strip().strip("\"'")
+            base = posixpath.basename(v.replace("\\", "/"))
+            if base and "." in base and len(base) <= 500:
+                m = re.search(r"\.(mp4|mkv|webm|avi|mov|m4v|ts|m2ts|mp3|m4a|flac|zip|rar|7z|iso|pdf|epub)$",
+                              base, re.IGNORECASE)
+                if m:
+                    # keep the extension when truncating over-long opaque names
+                    if len(base) > 200:
+                        ext = base[m.start():]
+                        base = base[:200 - len(ext)] + ext
+                    return sanitize_filename(base)
+        # last resort: path basename even without/odd extension
         path = urlparse(url).path
         base = posixpath.basename(path.rstrip("/"))
         if base:
@@ -154,3 +177,69 @@ def notify(title: str, body: str) -> None:
 def origin_of(url: str) -> str:
     p = urlparse(url)
     return f"{p.scheme}://{p.netloc}"
+
+
+_DOMAIN_RE = re.compile(r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
+
+
+def _decoded_domains(value: str) -> list[str]:
+    """Extract domain-like tokens from a query value, incl. base64-encoded blobs.
+
+    Hotlink-protected CDNs (e.g. cdntrex remote_control.php) embed the allowed
+    embedding site inside an opaque token such as acctoken=<b64(...|site|...)>.
+    """
+    found: list[str] = []
+    candidates = [value]
+    v = value.strip()
+    # try base64 (standard + urlsafe, missing padding tolerated)
+    for alt in (False, True):
+        try:
+            pad = "=" * (-len(v) % 4)
+            raw = base64.b64decode(v + pad, altchars=b"-_" if alt else None,
+                                   validate=False)
+            text = raw.decode("utf-8", errors="ignore")
+            if text and all(32 <= ord(c) < 127 or c in "\t" for c in text[:512]):
+                candidates.append(text)
+                break
+        except Exception:
+            continue
+    for text in candidates:
+        for m in _DOMAIN_RE.finditer(text):
+            start, end = m.start(), m.end()
+            # skip matches that are a prefix of a longer alnum token
+            # (e.g. "abc.mp" inside the filename "abc.mp4")
+            if end < len(text) and text[end].isalnum():
+                continue
+            if start > 0 and (text[start - 1].isalnum() or text[start - 1] in "-_"):
+                continue
+            host = m.group(0).strip(".-").lower()
+            if "." in host and host not in found:
+                found.append(host)
+    return found
+
+
+def referer_candidates(url: str) -> list[str]:
+    """Candidate Referer origins for hotlink-protected direct file URLs.
+
+    Order: embedding sites decoded from query tokens first (they are the ones
+    the CDN allowlist checks), then the file host's own origin last.
+    """
+    out: list[str] = []
+    try:
+        q = urlparse(url).query
+        for _, val in parse_qsl(q, keep_blank_values=True):
+            if not val or len(val) < 4:
+                continue
+            for host in _decoded_domains(val):
+                ref = f"https://{host}/"
+                if ref not in out:
+                    out.append(ref)
+    except Exception:
+        pass
+    try:
+        own = origin_of(url) + "/"
+        if own not in out:
+            out.append(own)
+    except Exception:
+        pass
+    return out

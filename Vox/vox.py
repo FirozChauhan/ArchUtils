@@ -48,6 +48,23 @@ IMAGE_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp", ".avif",
 })
 
+# Image output formats. AVIF is AV1 still-image compression (needs an AV1 encoder
+# and the AVIF muxer); JPEG uses ffmpeg's built-in mjpeg encoder via image2, which
+# every ffmpeg build has.
+IMAGE_FORMATS = {
+    "avif": {
+        "ext": ".avif",
+        "encoder": None,            # chosen at runtime: libsvtav1 / libaom-av1
+        "desc": "AVIF — best compression, newer apps/browsers only",
+    },
+    "jpeg": {
+        "ext": ".jpg",
+        "encoder": "mjpeg",
+        "desc": "JPEG — universal compatibility, larger files",
+    },
+}
+DEFAULT_IMAGE_FORMAT = "avif"
+
 # Suffixes that can never be a video — we probe unknown extensions with ffprobe
 # (some downloaders drop the extension entirely), but skip these obvious ones.
 KNOWN_NON_VIDEO_EXTENSIONS = frozenset({
@@ -60,6 +77,10 @@ KNOWN_NON_VIDEO_EXTENSIONS = frozenset({
 })
 
 OUTPUT_DIR_NAME = "Vox Output"
+PRESET_FILE_NAME = ".vox.json"
+
+# Preset targets: which conversion a saved preset describes.
+PRESET_TARGETS = ("video-hevc", "video-av1", "image-avif", "image-jpeg")
 
 X265_PRESETS = [
     "ultrafast", "superfast", "veryfast", "faster", "fast",
@@ -76,6 +97,11 @@ AOM_DEFAULT_PRESET = 6
 AV1_DEFAULT_CRF = 30
 AV1_CRF_MIN, AV1_CRF_MAX = 0, 63
 
+# JPEG quality: ffmpeg's -q:v scale, 2 (best) to 31 (worst). 2 is the default
+# because this is a "compress" tool and q:v 2 is still visually lossless-ish.
+JPEG_DEFAULT_CRF = 3
+JPEG_CRF_MIN, JPEG_CRF_MAX = 2, 31
+
 # pix_fmts that may carry a transparency channel — ffmpeg's AVIF muxer cannot
 # store alpha, so these are flattened onto a white background first.
 MAY_HAVE_ALPHA_PIXFMTS = frozenset({
@@ -85,6 +111,10 @@ MAY_HAVE_ALPHA_PIXFMTS = frozenset({
 })
 
 AUDIO_BITRATE = "192k"
+
+# Keys allowed in a saved preset. Anything else in .vox.json is ignored with a
+# warning so a hand-edited file can't crash a run.
+PRESET_KEYS = frozenset({"target", "preset", "crf", "copy_audio", "force"})
 
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -358,18 +388,222 @@ def resolve_settings(args: argparse.Namespace, encoders: set[str]) -> tuple[str,
     return codec, av1_enc, preset, crf
 
 
-def resolve_image_settings(args: argparse.Namespace, encoders: set[str]) -> tuple[str, str, int]:
-    """Return (av1_encoder, preset, crf) for AVIF still-image compression."""
+def resolve_image_settings(
+    args: argparse.Namespace, encoders: set[str],
+) -> tuple[str, str | None, str | None, int]:
+    """Return (format, av1_encoder, preset, crf) for still-image compression.
+
+    format is 'avif' or 'jpeg'. For jpeg, av1_encoder and preset are None and
+    crf is an ffmpeg -q:v value (2-31, lower = better).
+    """
     av1_enc = pick_av1_encoder(encoders)
-    if not av1_enc:
-        print(f"{RED}AVIF compression needs an AV1 encoder, but ffmpeg has neither "
-              f"libsvtav1 nor libaom-av1.{RESET}")
+    avif_ok = av1_enc is not None and has_avif_muxer()
+
+    fmt = args.format
+    if fmt is None:
+        options = []
+        if avif_ok:
+            options.append(("1", "avif", IMAGE_FORMATS["avif"]["desc"]))
+        options.append(("2", "jpeg", IMAGE_FORMATS["jpeg"]["desc"]))
+        if args.images and len(options) == 1:
+            fmt = options[0][1]
+            print(f"{YELLOW}Only {fmt.upper()} is available — using it.{RESET}")
+        else:
+            print(f"\n{BOLD}Target image format:{RESET}")
+            for key, _, desc in options:
+                print(f"  [{key}] {desc}")
+            choice = ask("Pick a format [1]: ").strip() or "1"
+            chosen = next((f for k, f, _ in options if k == choice), None)
+            if chosen is None:
+                print(f"{RED}Invalid choice: {choice}{RESET}")
+                sys.exit(1)
+            fmt = chosen
+
+    if fmt == "avif":
+        if not avif_ok:
+            print(f"{RED}AVIF compression needs an AV1 encoder and the AVIF muxer, but this "
+                  f"ffmpeg build is missing one of them. Use --format jpeg instead.{RESET}")
+            sys.exit(1)
+        preset = prompt_preset("av1", av1_enc, args.preset)
+        crf = prompt_crf("av1", args.crf)
+        return fmt, av1_enc, preset, crf
+
+    q = args.crf
+    if q is not None and not (JPEG_CRF_MIN <= q <= JPEG_CRF_MAX):
+        print(f"{RED}JPEG quality (-q:v) must be between {JPEG_CRF_MIN} and {JPEG_CRF_MAX} "
+              f"(got {q}).{RESET}")
         sys.exit(1)
-    print(f"\n{YELLOW}Target format: AVIF — AV1 still-image compression (best ratio, newer apps/"
-          f"browsers only).{RESET}")
-    preset = prompt_preset("av1", av1_enc, args.preset)
-    crf = prompt_crf("av1", args.crf)
-    return av1_enc, preset, crf
+    if q is None:
+        print(f"\n{BOLD}JPEG quality{RESET} (2 = best, 31 = worst; lower = better, bigger file).")
+    crf = q if q is not None else ask_int("Quality (-q:v)", JPEG_CRF_MIN, JPEG_CRF_MAX, JPEG_DEFAULT_CRF)
+    return fmt, None, None, crf
+
+
+# --------------------------------------------------------------------------- #
+# Presets (.vox.json, project-local)
+# --------------------------------------------------------------------------- #
+
+def preset_path(cwd: Path) -> Path:
+    return cwd / PRESET_FILE_NAME
+
+
+def load_presets(cwd: Path) -> dict[str, dict]:
+    """Read .vox.json in cwd. Returns {name: settings}; {} if absent/invalid."""
+    path = preset_path(cwd)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f"{YELLOW}Warning: could not read {path.name}: {e}{RESET}")
+        return {}
+    if not isinstance(data, dict):
+        print(f"{YELLOW}Warning: {path.name} should contain a JSON object — ignoring.{RESET}")
+        return {}
+    presets: dict[str, dict] = {}
+    for name, settings in data.items():
+        if not isinstance(settings, dict):
+            continue
+        unknown = set(settings) - PRESET_KEYS
+        if unknown:
+            print(f"{YELLOW}Warning: preset '{name}' has unknown key(s) "
+                  f"{', '.join(sorted(unknown))} — ignored.{RESET}")
+        clean = {k: v for k, v in settings.items() if k in PRESET_KEYS}
+        if clean.get("target") not in PRESET_TARGETS:
+            print(f"{YELLOW}Warning: preset '{name}' has invalid target "
+                  f"'{clean.get('target')}' — skipped.{RESET}")
+            continue
+        presets[name] = clean
+    return presets
+
+
+def save_presets(cwd: Path, presets: dict[str, dict]) -> None:
+    path = preset_path(cwd)
+    path.write_text(json.dumps(presets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def preset_label(settings: dict) -> str:
+    """One-line human summary of a preset's settings."""
+    target = settings.get("target", "?")
+    if target.startswith("video"):
+        detail = f"preset={settings.get('preset')}, CRF={settings.get('crf')}"
+    else:
+        if target == "image-jpeg":
+            detail = f"quality={settings.get('crf')}"
+        else:
+            detail = f"preset={settings.get('preset')}, CRF={settings.get('crf')}"
+    if settings.get("copy_audio"):
+        detail += ", copy-audio"
+    if settings.get("force"):
+        detail += ", force"
+    return f"{target} ({detail})"
+
+
+def build_preset_interactively(cwd: Path, encoders: set[str], name: str | None) -> tuple[str, dict] | None:
+    """Prompt for a preset and return (name, settings), or None if aborted."""
+    av1_enc = pick_av1_encoder(encoders)
+    hevc_ok = "libx265" in encoders
+    avif_ok = av1_enc is not None and has_avif_muxer()
+    jpeg_ok = "mjpeg" in encoders
+
+    options: list[tuple[str, str, str]] = []
+    if hevc_ok:
+        options.append(("1", "video-hevc", "Video → HEVC (H.265)"))
+    if av1_enc:
+        options.append(("2", "video-av1", f"Video → AV1 ({av1_enc})"))
+    if avif_ok:
+        options.append(("3", "image-avif", "Image → AVIF"))
+    if jpeg_ok:
+        options.append(("4", "image-jpeg", "Image → JPEG"))
+    if not options:
+        print(f"{RED}No usable encoder found — cannot create a preset.{RESET}")
+        return None
+
+    print(f"\n{BOLD}New preset{RESET} — what should it convert to?")
+    for key, _, desc in options:
+        print(f"  [{key}] {desc}")
+    choice = ask(f"Pick one [{options[0][0]}]: ").strip() or options[0][0]
+    target = next((t for k, t, _ in options if k == choice), None)
+    if target is None:
+        print(f"{RED}Invalid choice: {choice}{RESET}")
+        return None
+
+    settings: dict = {"target": target}
+    if target == "video-hevc":
+        settings["preset"] = prompt_preset("hevc", None, None)
+        settings["crf"] = prompt_crf("hevc", None)
+    elif target == "video-av1":
+        settings["preset"] = prompt_preset("av1", av1_enc, None)
+        settings["crf"] = prompt_crf("av1", None)
+    elif target == "image-avif":
+        settings["preset"] = prompt_preset("av1", av1_enc, None)
+        settings["crf"] = prompt_crf("av1", None)
+    else:  # image-jpeg
+        print(f"\n{BOLD}JPEG quality{RESET} (2 = best, 31 = worst; lower = better, bigger file).")
+        settings["crf"] = ask_int("Quality (-q:v)", JPEG_CRF_MIN, JPEG_CRF_MAX, JPEG_DEFAULT_CRF)
+
+    if target.startswith("video"):
+        ans = ask("Stream-copy audio instead of re-encoding to AAC? [y/N]: ").strip().lower()
+        if ans in ("y", "yes"):
+            settings["copy_audio"] = True
+    ans = ask("Always overwrite existing outputs (--force)? [y/N]: ").strip().lower()
+    if ans in ("y", "yes"):
+        settings["force"] = True
+
+    if name is None:
+        print()
+        while True:
+            name = ask("Preset name: ").strip()
+            if not name:
+                print(f"{RED}A name is required (or Ctrl-C to cancel).{RESET}")
+                continue
+            if name in load_presets(cwd):
+                overwrite = ask(f"'{name}' already exists. [o]verwrite/[c]ancel [c]: ").strip().lower()
+                if overwrite not in ("o", "overwrite", "y", "yes"):
+                    name = None
+                    continue
+            break
+    return name, settings
+
+
+def apply_preset(args: argparse.Namespace, settings: dict, name: str) -> argparse.Namespace:
+    """Overlay a preset onto args. Explicit CLI flags win over the preset."""
+    target = settings["target"]
+    codec, fmt = None, None
+    if target == "video-hevc":
+        codec = "hevc"
+    elif target == "video-av1":
+        codec = "av1"
+    elif target == "image-avif":
+        fmt = "avif"
+    elif target == "image-jpeg":
+        fmt = "jpeg"
+    is_image = target.startswith("image")
+
+    print(f"{BOLD}Using preset '{name}':{RESET} {preset_label(settings)}")
+
+    # Presets always process the whole directory.
+    args.all = True
+    args.files = []
+
+    def _set(attr, value):
+        current = getattr(args, attr, None)
+        if current is None:  # CLI didn't specify it
+            setattr(args, attr, value)
+
+    if is_image:
+        args.images = True
+        _set("format", fmt)
+    else:
+        args.images = False
+        _set("codec", codec)
+        if settings.get("copy_audio"):
+            args.copy_audio = True
+    _set("preset", settings.get("preset"))
+    _set("crf", settings.get("crf"))
+    if settings.get("force"):
+        args.force = True
+    return args
 
 
 # --------------------------------------------------------------------------- #
@@ -404,13 +638,15 @@ def select_files(args: argparse.Namespace, files: list[Path], cwd: Path, kind: s
     if args.all:
         return list(files)
 
+    # Preset runs force --all above, so this path is interactive-CLI only.
+
     print(f"\n{BOLD}Found {len(files)} {kind} file(s) in {cwd}:{RESET}")
     for i, v in enumerate(files, 1):
         size_mb = v.stat().st_size / (1024 * 1024)
         print(f"  [{i:2d}] {v.name}  ({size_mb:,.1f} MB)")
     choice = ask("\nConvert [a]ll, [n]one, or numbers like 1,3,5? [a]: ").lower()
     if choice in ("", "a", "all"):
-        return list(videos)
+        return list(files)
     if choice in ("n", "none", "q", "quit"):
         print("Nothing to do. Bye!")
         sys.exit(0)
@@ -420,8 +656,8 @@ def select_files(args: argparse.Namespace, files: list[Path], cwd: Path, kind: s
         if not part.isdigit():
             continue
         idx = int(part)
-        if 1 <= idx <= len(videos):
-            selected.append(videos[idx - 1])
+        if 1 <= idx <= len(files):
+            selected.append(files[idx - 1])
     if not selected:
         print(f"{RED}No valid selection — aborting.{RESET}")
         sys.exit(1)
@@ -611,40 +847,51 @@ def convert_one(
 # --------------------------------------------------------------------------- #
 
 def build_image_command(
-    src: Path, out: Path, av1_encoder: str, preset: str, crf: int, pix_fmt: str | None,
+    src: Path, out: Path, fmt: str, av1_encoder: str | None,
+    preset: str | None, crf: int, pix_fmt: str | None,
 ) -> list[str]:
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(src),
     ]
-    if pix_fmt in MAY_HAVE_ALPHA_PIXFMTS:
-        # ffmpeg's AVIF muxer can't store alpha — flatten transparency onto white
-        # so transparent areas don't come out as garbage.
-        cmd += ["-vf", "split[a][b];[b]drawbox=c=white:t=fill[bg];"
-                "[a][bg]overlay=shortest=1:format=auto"]
-    cmd += ["-c:v", av1_encoder]
-    if av1_encoder == "libsvtav1":
-        cmd += ["-preset", preset]
+    if fmt == "avif":
+        if pix_fmt in MAY_HAVE_ALPHA_PIXFMTS:
+            # ffmpeg's AVIF muxer can't store alpha — flatten transparency onto white
+            # so transparent areas don't come out as garbage.
+            cmd += ["-vf", "split[a][b];[b]drawbox=c=white:t=fill[bg];"
+                    "[a][bg]overlay=shortest=1:format=auto"]
+        cmd += ["-c:v", av1_encoder]
+        if av1_encoder == "libsvtav1":
+            cmd += ["-preset", preset]
+        else:
+            cmd += ["-cpu-used", preset, "-row-mt", "1"]
+        cmd += ["-crf", str(crf), "-still-picture", "1", "-strict", "-2"]
     else:
-        cmd += ["-cpu-used", preset, "-row-mt", "1"]
-    cmd += ["-crf", str(crf), "-still-picture", "1", "-strict", "-2"]
+        # JPEG: flatten any alpha (JPEG has no alpha channel) and set quality.
+        if pix_fmt in MAY_HAVE_ALPHA_PIXFMTS:
+            cmd += ["-vf", "split[a][b];[b]drawbox=c=white:t=fill[bg];"
+                    "[a][bg]overlay=shortest=1:format=auto"]
+        cmd += ["-c:v", IMAGE_FORMATS["jpeg"]["encoder"], "-q:v", str(crf)]
+        # image2 needs the extension to pick the format; we pass an explicit path.
+        cmd += ["-f", "image2"]
     cmd += ["-progress", "pipe:1", "-nostats", str(out)]
     return cmd
 
 
 def convert_image_core(
-    src: Path, out_dir: Path, av1_encoder: str, preset: str, crf: int,
-    force: bool, progress=None, decide=None,
+    src: Path, out_dir: Path, fmt: str, av1_encoder: str | None,
+    preset: str | None, crf: int, force: bool, progress=None, decide=None,
 ) -> tuple[str, str]:
-    """Shared AVIF compression for CLI and TUI.
+    """Shared still-image compression for CLI and TUI.
 
     Returns (status, note) with status in
     'ok' | 'already' | 'exists' | 'failed' | 'interrupted'.
     """
-    out_path = out_dir / f"{src.stem.rstrip()}.avif"
+    ext = IMAGE_FORMATS[fmt]["ext"]
+    out_path = out_dir / f"{src.stem.rstrip()}{ext}"
 
-    if src.suffix.lower().rstrip() == ".avif":
-        return "already", "already AVIF"
+    if src.suffix.lower().rstrip() == ext:
+        return "already", f"already {fmt.upper()}"
 
     if out_path.exists() and not force:
         if decide is None:
@@ -655,7 +902,7 @@ def convert_image_core(
 
     pix_fmt = probe_pix_fmt(src)
     flattened = pix_fmt in MAY_HAVE_ALPHA_PIXFMTS
-    cmd = build_image_command(src, out_path, av1_encoder, preset, crf, pix_fmt)
+    cmd = build_image_command(src, out_path, fmt, av1_encoder, preset, crf, pix_fmt)
     status, note = run_ffmpeg(cmd, None, src.name, progress)
     if status != "ok":
         try:
@@ -671,8 +918,8 @@ def convert_image_core(
 
 
 def convert_one_image(
-    src: Path, out_dir: Path, av1_encoder: str, preset: str, crf: int,
-    args: argparse.Namespace,
+    src: Path, out_dir: Path, fmt: str, av1_encoder: str | None,
+    preset: str | None, crf: int, args: argparse.Namespace,
 ) -> str:
     """CLI variant of convert_image_core with human-readable output."""
     size_mb = src.stat().st_size / (1024 * 1024)
@@ -680,11 +927,11 @@ def convert_one_image(
 
     decide = (lambda prompt, default: ask(prompt)) if sys.stdin.isatty() else None
     status, note = convert_image_core(
-        src, out_dir, av1_encoder, preset, crf,
+        src, out_dir, fmt, av1_encoder, preset, crf,
         force=args.force, progress=None, decide=decide,
     )
     if status == "ok":
-        out_path = out_dir / f"{src.stem.rstrip()}.avif"
+        out_path = out_dir / f"{src.stem.rstrip()}{IMAGE_FORMATS[fmt]['ext']}"
         new_mb = out_path.stat().st_size / (1024 * 1024)
         print(f"{GREEN}[ok] {note}  ({new_mb:,.1f} MB){RESET}")
         return "ok"
@@ -695,7 +942,7 @@ def convert_one_image(
         print(f"{YELLOW}Interrupted — {note}.{RESET}")
         return "failed"
     if status == "already":
-        print(f"{YELLOW}[skip] {src.name} is already AVIF — nothing to compress "
+        print(f"{YELLOW}[skip] {src.name} is already {fmt.upper()} — nothing to compress "
               f"(use --force to re-encode anyway).{RESET}")
         return "already"
     print(f"{YELLOW}[skip] {note} (use --force to overwrite).{RESET}")
@@ -722,12 +969,18 @@ class Tui:
             self.codec_options.append("hevc")
         if self.av1_enc:
             self.codec_options.append("av1")
+        # Image formats this build can write: AVIF needs an AV1 encoder + muxer;
+        # JPEG only needs the built-in mjpeg encoder, so it's always available.
+        self.image_format_options = []
+        if self.av1_enc and self.avif_ok:
+            self.image_format_options.append("avif")
+        self.image_format_options.append("jpeg")
         # Only offer modes that are possible AND have files in this folder,
         # so e.g. a folder of only images skips the mode screen entirely.
         self.mode_options = []
         if self.codec_options and self.videos:
             self.mode_options.append("video")
-        if self.av1_enc and self.avif_ok and self.images:
+        if self.image_format_options and self.images:
             self.mode_options.append("image")
         self.screen = "mode" if len(self.mode_options) > 1 else "files"
         self.cursor = 0
@@ -752,7 +1005,11 @@ class Tui:
         """(Re)initialise codec/preset/selection state for the given mode."""
         self.mode = mode
         if mode == "image":
-            self.codec = "av1"
+            self.image_format = (
+                self.args.format if self.args.format in self.image_format_options
+                else self.image_format_options[0]
+            )
+            self.codec = "av1" if self.image_format == "avif" else "jpeg"
         else:
             self.codec = self.args.codec if self.args.codec in self.codec_options else self.codec_options[0]
         self._reset_for_codec()
@@ -765,6 +1022,8 @@ class Tui:
     # -- setup ------------------------------------------------------------- #
 
     def _preset_list(self) -> list[str]:
+        if self.codec == "jpeg":
+            return []  # JPEG has no speed preset — only a quality value
         if self.codec == "hevc":
             return list(X265_PRESETS)
         if self.av1_enc == "libsvtav1":
@@ -772,23 +1031,30 @@ class Tui:
         return [str(n) for n in range(AOM_PRESET_MIN, AOM_PRESET_MAX + 1)]
 
     def _default_preset(self) -> str:
+        if self.codec == "jpeg":
+            return ""
         if self.codec == "hevc":
             return X265_DEFAULT_PRESET
         return str(SVT_DEFAULT_PRESET if self.av1_enc == "libsvtav1" else AOM_DEFAULT_PRESET)
 
     def _default_crf(self) -> int:
+        if self.codec == "jpeg":
+            return JPEG_DEFAULT_CRF
         return X265_DEFAULT_CRF if self.codec == "hevc" else AV1_DEFAULT_CRF
 
     def _reset_for_codec(self):
         self.preset_list = self._preset_list()
-        if self.args.preset is not None and self.args.preset in self.preset_list:
+        if self.preset_list and self.args.preset is not None and self.args.preset in self.preset_list:
             self.preset = self.args.preset
         else:
             self.preset = self._default_preset()
-        self.preset_idx = self.preset_list.index(self.preset)
-        self.crf_lo, self.crf_hi = (
-            (X265_CRF_MIN, X265_CRF_MAX) if self.codec == "hevc" else (AV1_CRF_MIN, AV1_CRF_MAX)
-        )
+        self.preset_idx = self.preset_list.index(self.preset) if self.preset_list else 0
+        if self.codec == "jpeg":
+            self.crf_lo, self.crf_hi = JPEG_CRF_MIN, JPEG_CRF_MAX
+        elif self.codec == "hevc":
+            self.crf_lo, self.crf_hi = X265_CRF_MIN, X265_CRF_MAX
+        else:
+            self.crf_lo, self.crf_hi = AV1_CRF_MIN, AV1_CRF_MAX
         if self.args.crf is not None:
             self.crf = max(self.crf_lo, min(self.crf_hi, self.args.crf))
         else:
@@ -903,6 +1169,7 @@ class Tui:
         {
             "mode": self._render_mode,
             "files": self._render_files,
+            "image_format": self._render_image_format,
             "codec": self._render_codec,
             "preset": self._render_preset,
             "crf": self._render_crf,
@@ -954,28 +1221,36 @@ class Tui:
         self.paint(lines)
 
     def _key_files(self, key):
+        files = self._mode_files()
         if key == "up":
             self.cursor = max(0, self.cursor - 1)
         elif key == "down":
-            self.cursor = min(len(self.videos) - 1, self.cursor + 1)
+            self.cursor = min(len(files) - 1, self.cursor + 1)
         elif key in ("home", "end"):
-            self.cursor = 0 if key == "home" else len(self.videos) - 1
+            self.cursor = 0 if key == "home" else len(files) - 1
         elif key == "space":
             if self.cursor in self.selected:
                 self.selected.discard(self.cursor)
             else:
                 self.selected.add(self.cursor)
         elif key == "a":
-            self.selected = set(range(len(self.videos)))
+            self.selected = set(range(len(files)))
         elif key == "n":
             self.selected.clear()
         elif key == "enter":
             if not self.selected:
                 self._flash("Nothing selected — press Space to pick files, or a to select all.")
             elif self.mode == "image":
-                # images have a single target format (AVIF) — straight to preset
-                self.screen = "preset"
-                self.cursor = self.preset_idx
+                # Pick the target format first when there's a choice the user
+                # hasn't already made explicitly on the command line.
+                if len(self.image_format_options) > 1 and self.args.format is None:
+                    self.screen = "image_format"
+                    self.cursor = self.image_format_options.index(self.image_format)
+                elif self.image_format == "jpeg":
+                    self.screen = "crf"  # JPEG has no preset step
+                else:
+                    self.screen = "preset"
+                    self.cursor = self.preset_idx
             else:
                 self.screen = "codec"
                 self.cursor = self.codec_options.index(self.codec)
@@ -996,7 +1271,7 @@ class Tui:
             if m == "video":
                 desc = f"Convert {len(self.videos)} video(s) → HEVC or AV1"
             else:
-                desc = f"Compress {len(self.images)} image(s) → AVIF"
+                desc = f"Compress {len(self.images)} image(s) → {self._image_format_label()}"
             text = f"  {desc}"
             if i == self.cursor:
                 text = self.hl(text, True)
@@ -1021,6 +1296,39 @@ class Tui:
             self.cursor = 0
         elif key in ("q", "esc"):
             self.exit_requested = True
+
+    def _image_format_label(self) -> str:
+        return "AVIF or JPEG" if len(self.image_format_options) > 1 else self.image_format.upper()
+
+    def _render_image_format(self):
+        descs = {f: IMAGE_FORMATS[f]["desc"] for f in self.image_format_options}
+        lines = [self._title("Target image format"), ""]
+        for i, f in enumerate(self.image_format_options):
+            mark = "•" if f == self.image_format else " "
+            text = f" {mark} {descs[f]}"
+            if i == self.cursor:
+                text = self.hl(text, True)
+            lines.append(text)
+        lines.append("")
+        lines.append(" ↑/↓ move · Enter select · Esc back")
+        self.paint(lines)
+
+    def _key_image_format(self, key):
+        if key == "up":
+            self.cursor = max(0, self.cursor - 1)
+        elif key == "down":
+            self.cursor = min(len(self.image_format_options) - 1, self.cursor + 1)
+        elif key == "enter":
+            self.image_format = self.image_format_options[self.cursor]
+            self.codec = "av1" if self.image_format == "avif" else "jpeg"
+            self._reset_for_codec()
+            if self.codec == "jpeg":
+                self.screen = "crf"
+            else:
+                self.screen = "preset"
+                self.cursor = self.preset_idx
+        elif key == "esc":
+            self.screen = "files"
 
     def _render_codec(self):
         descs = {
@@ -1096,20 +1404,31 @@ class Tui:
             self.screen = "crf"
         elif key == "esc":
             if self.mode == "image":
-                self.screen = "files"
+                if len(self.image_format_options) > 1 and self.args.format is None:
+                    self.screen = "image_format"
+                    self.cursor = self.image_format_options.index(self.image_format)
+                else:
+                    self.screen = "files"
             else:
                 self.screen = "codec"
                 self.cursor = self.codec_options.index(self.codec)
 
     def _render_crf(self):
         lo, hi = self.crf_lo, self.crf_hi
-        hint = "HEVC: typical 18-28" if self.codec == "hevc" else "AV1: typical 24-40"
+        if self.codec == "jpeg":
+            hint = "JPEG -q:v: 2 (best) to 31 (worst)"
+        elif self.codec == "hevc":
+            hint = "HEVC: typical 18-28"
+        else:
+            hint = "AV1: typical 24-40"
         scale_w = min(40, shutil.get_terminal_size((80, 24)).columns - 10)
         span = hi - lo
         pos = int((self.crf - lo) / span * scale_w) if span else 0
         bar = "-" * pos + "▲" + "-" * max(0, scale_w - pos - 1)
+        title = ("JPEG quality (-q:v) — lower = better, bigger file" if self.codec == "jpeg"
+                 else "Quality (CRF) — lower = better, bigger file")
         lines = [
-            self._title("Quality (CRF) — lower = better, bigger file"),
+            self._title(title),
             "",
             f"  value: {BOLD}{self.crf}{RESET}    ({hint})",
             f"  {bar}",
@@ -1133,8 +1452,15 @@ class Tui:
             self._run_conversions()
             self.screen = "done"
         elif key == "esc":
-            self.screen = "preset"
-            self.cursor = self.preset_idx
+            if self.mode == "image" and self.codec == "jpeg":
+                if len(self.image_format_options) > 1 and self.args.format is None:
+                    self.screen = "image_format"
+                    self.cursor = self.image_format_options.index(self.image_format)
+                else:
+                    self.screen = "files"
+            else:
+                self.screen = "preset"
+                self.cursor = self.preset_idx
 
     # -- conversion -------------------------------------------------------- #
 
@@ -1163,7 +1489,7 @@ class Tui:
 
             if self.mode == "image":
                 status, note = convert_image_core(
-                    src, out_dir, self.av1_enc, self.preset, self.crf,
+                    src, out_dir, self.image_format, self.av1_enc, self.preset, self.crf,
                     force=self.args.force, progress=progress, decide=None,
                 )
             else:
@@ -1200,11 +1526,16 @@ class Tui:
     def _paint_convert(self):
         cols = shutil.get_terminal_size((80, 24)).columns
         if self.mode == "image":
-            codec_label = f"AVIF ({self.av1_enc})"
+            codec_label = (f"AVIF ({self.av1_enc})" if self.image_format == "avif"
+                           else "JPEG (mjpeg)")
         else:
             codec_label = "HEVC (x265)" if self.codec == "hevc" else f"AV1 ({self.av1_enc})"
+        if self.mode == "image" and self.image_format == "jpeg":
+            settings = f"quality {self.crf}"
+        else:
+            settings = f"preset {self.preset} · CRF {self.crf}"
         lines = [self._title("Converting")]
-        lines.append(f" {len(self.jobs)} file(s) → {codec_label} · preset {self.preset} · CRF {self.crf}")
+        lines.append(f" {len(self.jobs)} file(s) → {codec_label} · {settings}")
         lines.append(f" Output: {self.cwd / OUTPUT_DIR_NAME}")
         lines.append("")
         bar_w = max(10, min(30, cols - 44))
@@ -1262,26 +1593,91 @@ class Tui:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="vox",
-        description="Convert videos to HEVC (H.265) or AV1, or compress images to AVIF, with ffmpeg.",
+        description="Convert videos to HEVC (H.265) or AV1, or compress images to AVIF/JPEG, with ffmpeg.",
         epilog=(
             "examples:\n"
             "  python vox.py                            interactive TUI (mode → files → codec → preset → CRF)\n"
             "  python vox.py --all --codec hevc         convert every video to HEVC, no TUI\n"
             "  python vox.py movie.mkv --codec av1 --preset 8 --crf 30\n"
-            "  python vox.py --images                   interactive TUI, compress images to AVIF\n"
-            "  python vox.py --all --images --crf 34    compress every image to AVIF, no TUI\n"
+            "  python vox.py --images                   interactive TUI, compress images (AVIF or JPEG)\n"
+            "  python vox.py --all --images --format jpeg --crf 3   every image → JPEG, no TUI\n"
+            "  python vox.py mk web                     create a preset named 'web' in .vox.json\n"
+            "  python vox.py --use web                  convert the whole folder with preset 'web'\n"
+            "  python vox.py ls                         list presets in this folder\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("action", nargs="?", choices=["mk", "ls", "rm"],
+                   help="preset action: mk (create), ls (list), rm (delete)")
+    p.add_argument("name", nargs="?", help="preset name for mk / rm")
+    p.add_argument("--use", metavar="NAME", help="convert the whole folder using a saved preset")
     p.add_argument("files", nargs="*", help="specific files to convert (default: interactive selection)")
     p.add_argument("--codec", choices=["hevc", "av1"], help="target codec (default: ask)")
     p.add_argument("--preset", help="quality preset: x265 name (e.g. medium, slow) or AV1 number (0-13)")
     p.add_argument("--crf", type=int, help="quality: lower = better, bigger file (defaults: HEVC 24, AV1/AVIF 30)")
     p.add_argument("--all", action="store_true", help="convert every video in the folder without asking")
-    p.add_argument("--images", action="store_true", help="compress images to AVIF instead of converting videos")
+    p.add_argument("--images", action="store_true", help="compress images (AVIF or JPEG) instead of converting videos")
+    p.add_argument("--format", choices=["avif", "jpeg"], help="image output format (default: ask; AVIF if available)")
     p.add_argument("--force", action="store_true", help="overwrite files that already exist in Vox Output")
     p.add_argument("--copy-audio", action="store_true", help="copy the original audio stream instead of re-encoding to AAC")
     return p.parse_args()
+
+
+def cmd_mk(cwd: Path, encoders: set[str], name: str | None) -> int:
+    result = build_preset_interactively(cwd, encoders, name)
+    if result is None:
+        return 1
+    name, settings = result
+    presets = load_presets(cwd)
+    existed = name in presets
+    presets[name] = settings
+    try:
+        save_presets(cwd, presets)
+    except OSError as e:
+        print(f"{RED}Could not write {preset_path(cwd).name}: {e}{RESET}")
+        return 1
+    verb = "Updated" if existed else "Saved"
+    print(f"\n{GREEN}{verb} preset '{name}' → {preset_path(cwd).name}{RESET}")
+    print(f"  {preset_label(settings)}")
+    print(f"\nRun it with:  python vox.py --use {name}")
+    return 0
+
+
+def cmd_ls(cwd: Path) -> int:
+    presets = load_presets(cwd)
+    if not presets:
+        print(f"{YELLOW}No presets in {cwd}.{RESET}")
+        print("Create one with:  python vox.py mk <name>")
+        return 0
+    print(f"{BOLD}Presets in {preset_path(cwd).name}:{RESET}")
+    width = max(len(n) for n in presets)
+    for name in sorted(presets):
+        print(f"  {name:<{width}}  {preset_label(presets[name])}")
+    return 0
+
+
+def cmd_rm(cwd: Path, name: str | None) -> int:
+    presets = load_presets(cwd)
+    if not presets:
+        print(f"{YELLOW}No presets in {cwd}.{RESET}")
+        return 1
+    if name is None:
+        print("Which preset? " + ", ".join(sorted(presets)))
+        name = ask("Name: ").strip()
+    if name not in presets:
+        print(f"{RED}No preset named '{name}'.{RESET}")
+        return 1
+    del presets[name]
+    try:
+        if presets:
+            save_presets(cwd, presets)
+        else:
+            preset_path(cwd).unlink(missing_ok=True)
+    except OSError as e:
+        print(f"{RED}Could not update {preset_path(cwd).name}: {e}{RESET}")
+        return 1
+    print(f"{GREEN}Removed preset '{name}'.{RESET}")
+    return 0
 
 
 def main() -> int:
@@ -1293,6 +1689,31 @@ def main() -> int:
         return 1
 
     cwd = Path.cwd()
+
+    # Preset subcommands act on the current folder's .vox.json and exit.
+    if args.action in ("mk", "ls", "rm"):
+        if args.use:
+            print(f"{RED}--use cannot be combined with '{args.action}'.{RESET}")
+            return 1
+        encoders = available_encoders()
+        if args.action == "mk":
+            return cmd_mk(cwd, encoders, args.name)
+        if args.action == "ls":
+            return cmd_ls(cwd)
+        return cmd_rm(cwd, args.name)
+
+    # --use overlays a saved preset onto the args, then continues as a normal run.
+    if args.use:
+        presets = load_presets(cwd)
+        if args.use not in presets:
+            print(f"{RED}No preset named '{args.use}' in {preset_path(cwd).name}.{RESET}")
+            if presets:
+                print("Available: " + ", ".join(sorted(presets)))
+            else:
+                print("Create one with:  python vox.py mk <name>")
+            return 1
+        args = apply_preset(args, presets[args.use], args.use)
+
     videos = discover_videos(cwd)
     images = discover_images(cwd)
     # Explicit image files (e.g. `vox.py photo.png`) switch to image mode automatically.
@@ -1317,6 +1738,7 @@ def main() -> int:
     encoders = available_encoders()
     av1_enc = pick_av1_encoder(encoders)
     avif_ok = has_avif_muxer()
+    jpeg_ok = "mjpeg" in encoders
 
     # Full-screen TUI when launched interactively with no explicit targets.
     use_tui = (
@@ -1327,11 +1749,11 @@ def main() -> int:
         and getattr(sys.stdout, "isatty", lambda: False)()
     )
     if use_tui:
-        if image_mode and (not av1_enc or not avif_ok):
-            print(f"{RED}AVIF compression needs an AV1 encoder and AVIF muxer, but this ffmpeg "
-                  f"build is missing one of them.{RESET}")
+        # JPEG is always possible (built-in mjpeg); AVIF only with an AV1 encoder + muxer.
+        if image_mode and not (av1_enc and avif_ok) and not jpeg_ok:
+            print(f"{RED}No usable image encoder found (neither AVIF nor JPEG).{RESET}")
             return 1
-        if not ("libx265" in encoders or av1_enc):
+        if not image_mode and not ("libx265" in encoders or av1_enc):
             print(f"{RED}No usable encoder found. ffmpeg is installed but lacks libx265 and AV1 encoders.{RESET}")
             print("On Debian/Ubuntu:  sudo apt install ffmpeg libx265-dev  (or use a static ffmpeg build)")
             return 1
@@ -1339,21 +1761,22 @@ def main() -> int:
         return 0
 
     if image_mode:
-        if not avif_ok:
-            print(f"{RED}This ffmpeg build has no AVIF muxer — cannot write .avif files.{RESET}")
-            return 1
-        av1_encoder, preset, crf = resolve_image_settings(args, encoders)
+        fmt, av1_encoder, preset, crf = resolve_image_settings(args, encoders)
         selected = select_files(args, images, cwd, "image")
 
         out_dir = cwd / OUTPUT_DIR_NAME
         out_dir.mkdir(exist_ok=True)
-
-        print(f"\n{BOLD}Plan:{RESET} {len(selected)} image(s) → AVIF ({av1_encoder}), preset={preset}, CRF={crf}")
-        print(f"Output folder: {out_dir}  (files keep their original names, .avif extension)\n")
+        ext = IMAGE_FORMATS[fmt]["ext"]
+        if fmt == "avif":
+            plan = f"AVIF ({av1_encoder}), preset={preset}, CRF={crf}"
+        else:
+            plan = f"JPEG (mjpeg), quality={crf}"
+        print(f"\n{BOLD}Plan:{RESET} {len(selected)} image(s) → {plan}")
+        print(f"Output folder: {out_dir}  (files keep their original names, {ext} extension)\n")
 
         converted, already, exists, failed = 0, 0, 0, []
         for path in selected:
-            status = convert_one_image(path, out_dir, av1_encoder, preset, crf, args)
+            status = convert_one_image(path, out_dir, fmt, av1_encoder, preset, crf, args)
             if status == "ok":
                 converted += 1
             elif status == "failed":
@@ -1369,7 +1792,7 @@ def main() -> int:
             print(f"{RED}Failed ({len(failed)}): {', '.join(failed)}{RESET}")
         print(f"{GREEN}Done. {converted} compressed, {skipped} skipped, {len(failed)} failed.{RESET}")
         if converted == 0 and already and not exists and not failed:
-            print(f"{YELLOW}Tip: file(s) were skipped because they are already AVIF — nothing to compress.")
+            print(f"{YELLOW}Tip: file(s) were skipped because they are already {fmt.upper()} — nothing to compress.")
             print(f"      Use --force to re-encode anyway (not recommended, loses quality).{RESET}")
         print(f"{GREEN}Output: {out_dir}{RESET}")
         return 1 if failed else 0

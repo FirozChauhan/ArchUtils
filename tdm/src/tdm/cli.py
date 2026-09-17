@@ -229,11 +229,20 @@ def one(cfg: dict, args, raw_url: str) -> dict:
 
     referer = args.referer or net.get("referer", "") or (page_url if page_url != dl_url else "")
 
-    # 2. probe
+    # 2. probe (probe auto-retries hotlink 403s with derived Referers)
     sess = make_session(impersonate, user_agent, cookies, proxy, timeout)
     probe = probe_url(sess, dl_url, page_url=referer, timeout=timeout)
     if probe.status in (401, 404, 410):
         raise DownloadError(f"probe HTTP {probe.status} for {dl_url}")
+    if probe.status == 403:
+        raise DownloadError(
+            f"probe HTTP 403 for {dl_url} (hotlink/expired token? "
+            f"try --referer https://<embedding-site>/ or --cookies)"
+        )
+    if not referer and probe.referer:
+        # probe discovered a working Referer (e.g. site hidden in acctoken);
+        # the chunk fetches must send the same one or they get 403.
+        referer = probe.referer
 
     # 3. filename
     if args.output:
@@ -294,6 +303,7 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         "resumable": probe.resumable,
         "connections": eff,
         "content_type": probe.content_type,
+        "referer": referer,
     }
 
     if args.dry_run:

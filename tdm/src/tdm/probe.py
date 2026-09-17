@@ -7,7 +7,7 @@ from pathlib import Path
 
 from curl_cffi import requests as cr
 
-from .util import filename_from_cd, origin_of
+from .util import filename_from_cd, origin_of, referer_candidates
 
 CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -43,6 +43,7 @@ class Probe:
     etag: str
     last_modified: str
     status: int
+    referer: str = ""  # Referer value that produced this result ("" = none sent)
 
 
 def make_session(
@@ -83,12 +84,11 @@ def _total_from(resp) -> int:
         return 0
 
 
-def probe_url(s: cr.Session, url: str, page_url: str = "", timeout: int = 30) -> Probe:
-    """Cheap 1-byte probe. Falls back gracefully when server ignores Range."""
+def _probe_once(s: cr.Session, url: str, ref: str, timeout: int) -> Probe:
+    """Single 1-byte probe attempt with the given Referer ("" = none)."""
     headers = dict(DL_HEADERS)
     headers["Accept-Encoding"] = "identity"
     headers["Range"] = "bytes=0-0"
-    ref = page_url or ""
     if ref:
         headers["Referer"] = ref
         try:
@@ -97,6 +97,8 @@ def probe_url(s: cr.Session, url: str, page_url: str = "", timeout: int = 30) ->
             )
         except Exception:
             headers["Sec-Fetch-Site"] = "cross-site"
+    else:
+        headers.pop("Sec-Fetch-Site", None)
     r = s.get(url, headers=headers, stream=True, timeout=timeout, allow_redirects=True)
     # read at most 1 byte to let server send headers, then close
     try:
@@ -120,7 +122,33 @@ def probe_url(s: cr.Session, url: str, page_url: str = "", timeout: int = 30) ->
         etag=r.headers.get("etag", ""),
         last_modified=r.headers.get("last-modified", ""),
         status=status,
+        referer=ref,
     )
+
+
+def probe_url(s: cr.Session, url: str, page_url: str = "", timeout: int = 30) -> Probe:
+    """Cheap 1-byte probe. Falls back gracefully when server ignores Range.
+
+    Hotlink-protected hosts answer 403 when no (or a wrong) Referer is sent.
+    On 403, retry with Referer candidates derived from the URL itself (e.g.
+    the embedding site hidden inside cdntrex-style acctoken params) and
+    return the first non-403 result, remembering the working Referer.
+    """
+    first = _probe_once(s, url, page_url or "", timeout)
+    if first.status != 403:
+        return first
+    seen = {page_url or ""}
+    for cand in referer_candidates(url):
+        if cand in seen:
+            continue
+        seen.add(cand)
+        try:
+            p = _probe_once(s, url, cand, timeout)
+        except Exception:
+            continue
+        if p.status != 403:
+            return p
+    return first
 
 
 def is_challenge(resp) -> bool:
