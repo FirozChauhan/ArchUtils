@@ -32,9 +32,9 @@ python3 vox.py --all --images --crf 34              # every image → AVIF
 python3 vox.py --all --images --format jpeg --crf 3 # every image → JPEG
 python3 vox.py clip.mp4 --copy-audio --force        # keep original audio, overwrite output
 
-python3 vox.py mk web                               # build a named preset in .vox.json
+python3 vox.py mk web                               # build a global named preset
 python3 vox.py --use web                            # convert the whole folder with it
-python3 vox.py ls                                   # list presets in this folder
+python3 vox.py ls                                   # list global presets
 python3 vox.py rm web                               # delete one
 ```
 
@@ -55,12 +55,12 @@ Results always land in a `Vox Output/` subfolder. Originals are never modified.
 | `--copy-audio` | flag | — | Stream-copy audio instead of re-encoding to AAC |
 | `--use` | `NAME` | — | Apply a saved preset to the whole folder |
 | `mk` | subcommand | — | Interactively create/update a preset (`mk [name]`) |
-| `ls` | subcommand | — | List presets in the current folder |
-| `rm` | subcommand | — | Delete a preset (`rm <name>`) |
+| `ls` | subcommand | — | List global presets |
+| `rm` | subcommand | — | Delete a global preset (`rm <name>`) |
 
 ## Presets
 
-A preset bundles the target and quality settings you use often, stored **in the current folder** as `.vox.json` — so a project keeps its own conventions and nothing is written to a global config.
+A preset bundles the target and quality settings you use often, stored **globally** as `~/.config/vox/presets.json` (or `$XDG_CONFIG_HOME/vox/presets.json`) — so it works from any folder and never clutters your media directories.
 
 ```bash
 python3 vox.py mk web          # answer a few prompts, saved as "web"
@@ -90,7 +90,7 @@ Explicit command-line flags always win over the preset, so `vox --use web --crf 
 - **Loss-prevention guards** — skips sources already in the target codec and outputs that already exist, unless `--force`.
 - **Transparency flattening** — the AVIF muxer can't store alpha, so transparent images are composited onto white instead of encoding as garbage.
 - **Clean failure semantics** — a partial output is unlinked on any non-ok status, so `Vox Output` never accumulates corrupt files.
-- **Named presets** — `vox mk` saves a reusable target+quality bundle to a project-local `.vox.json`; `vox --use <name>` runs it over the folder, and CLI flags override individual fields.
+- **Named presets** — `vox mk` saves a reusable target+quality bundle to the global `~/.config/vox/presets.json`; `vox --use <name>` runs it over the folder, and CLI flags override individual fields.
 - **Full-screen TUI** — arrow-key wizard (mode → files → codec/format → preset → CRF) with live per-file progress from ffmpeg's `-progress pipe:1`.
 - **Interrupt-safe** — Ctrl-C terminates ffmpeg, cleans up and stops the batch, leaving a countable state.
 
@@ -104,11 +104,11 @@ Explicit command-line flags always win over the preset, so `vox --use web --crf 
 | AV1 preset | int | `8` (SVT) / `6` (AOM) | 0–13 / 0–11 |
 | AV1 + AVIF CRF | int | `30` | 0–63 |
 | JPEG quality (`-q:v`) | int | `3` | 2–31 (lower = better) |
-| Preset file | path | `./.vox.json` | Project-local named presets (`vox mk`) |
+| Preset file | path | `~/.config/vox/presets.json` | Global named presets (`vox mk`) |
 
 ## Environment Variables
 
-None. The only state is the optional project-local `.vox.json` written by `vox mk`; delete it and Vox is back to pure flags-and-prompts.
+None. The only state is the optional global `~/.config/vox/presets.json` written by `vox mk`; delete it and Vox is back to pure flags-and-prompts. A legacy per-folder `.vox.json` is still read once if no global file exists, to ease migration.
 
 ## Development
 
@@ -123,7 +123,7 @@ Single file, stdlib only — keep it that way. `validate_preset`, the CRF clamps
 
 ```mermaid
 flowchart TD
-    P[--use name<br/>.vox.json] -.-> C
+    P[--use name<br/>~/.config/vox/presets.json] -.-> C
     A[Scan folder<br/>extensions + ffprobe] --> B[Pick files<br/>TUI · args · --all]
     B --> C[Codec/format · preset · CRF<br/>validated per encoder]
     C --> D[Probe source<br/>codec · duration · pix_fmt]
@@ -134,7 +134,7 @@ flowchart TD
     F -- failure --> H[Unlink partial output]
 ```
 
-Startup probes encoder and muxer availability, then each file goes scan → guard → probe → encode → verify. A saved preset (`vox mk`, dashed edge) feeds straight into the settings stage, with explicit CLI flags taking precedence. Key decisions: never write in place, so originals are untouchable by construction; ask ffmpeg what it can do instead of assuming a build; flatten alpha rather than emit corrupt AVIF/JPEG; delete partials on failure; keep preset state project-local in `.vox.json`.
+Startup probes encoder and muxer availability, then each file goes scan → guard → probe → encode → verify. A saved preset (`vox mk`, dashed edge) feeds straight into the settings stage, with explicit CLI flags taking precedence. Key decisions: never write in place, so originals are untouchable by construction; ask ffmpeg what it can do instead of assuming a build; flatten alpha rather than emit corrupt AVIF/JPEG; delete partials on failure; keep preset state global in `~/.config/vox/presets.json`.
 
 ## Contributing
 

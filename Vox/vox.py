@@ -77,7 +77,10 @@ KNOWN_NON_VIDEO_EXTENSIONS = frozenset({
 })
 
 OUTPUT_DIR_NAME = "Vox Output"
-PRESET_FILE_NAME = ".vox.json"
+# Global preset store: ~/.config/vox/presets.json (or $XDG_CONFIG_HOME/vox/presets.json).
+# Legacy per-folder .vox.json files are still read once for migration.
+PRESET_FILE_NAME = "presets.json"
+LEGACY_PRESET_FILE_NAME = ".vox.json"
 
 # Preset targets: which conversion a saved preset describes.
 PRESET_TARGETS = ("video-hevc", "video-av1", "image-avif", "image-jpeg")
@@ -440,25 +443,29 @@ def resolve_image_settings(
 
 
 # --------------------------------------------------------------------------- #
-# Presets (.vox.json, project-local)
+# Presets (global: ~/.config/vox/presets.json)
 # --------------------------------------------------------------------------- #
 
-def preset_path(cwd: Path) -> Path:
-    return cwd / PRESET_FILE_NAME
+def preset_path(cwd: Path | None = None) -> Path:
+    """Global preset file. `cwd` is accepted for backward-compat and ignored."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "vox" / PRESET_FILE_NAME
 
 
-def load_presets(cwd: Path) -> dict[str, dict]:
-    """Read .vox.json in cwd. Returns {name: settings}; {} if absent/invalid."""
-    path = preset_path(cwd)
-    if not path.is_file():
-        return {}
+def _legacy_preset_path(cwd: Path) -> Path:
+    return cwd / LEGACY_PRESET_FILE_NAME
+
+
+def _parse_presets_file(path: Path) -> dict[str, dict]:
+    """Read and validate a preset file. Returns {name: settings}."""
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError, json.JSONDecodeError) as e:
-        print(f"{YELLOW}Warning: could not read {path.name}: {e}{RESET}")
+        print(f"{YELLOW}Warning: could not read {path}: {e}{RESET}")
         return {}
     if not isinstance(data, dict):
-        print(f"{YELLOW}Warning: {path.name} should contain a JSON object — ignoring.{RESET}")
+        print(f"{YELLOW}Warning: {path} should contain a JSON object — ignoring.{RESET}")
         return {}
     presets: dict[str, dict] = {}
     for name, settings in data.items():
@@ -477,8 +484,24 @@ def load_presets(cwd: Path) -> dict[str, dict]:
     return presets
 
 
-def save_presets(cwd: Path, presets: dict[str, dict]) -> None:
+def load_presets(cwd: Path | None = None) -> dict[str, dict]:
+    """Read global presets. Falls back to legacy cwd/.vox.json for migration."""
     path = preset_path(cwd)
+    if path.is_file():
+        return _parse_presets_file(path)
+    # One-time migration path: read legacy per-folder file if global is absent.
+    if cwd is not None:
+        legacy = _legacy_preset_path(cwd)
+        if legacy.is_file():
+            print(f"{YELLOW}Note: using legacy presets from {legacy} — "
+                  f"run `vox mk` to re-save them globally to {path}.{RESET}")
+            return _parse_presets_file(legacy)
+    return {}
+
+
+def save_presets(cwd: Path | None, presets: dict[str, dict]) -> None:
+    path = preset_path(cwd)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(presets, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
@@ -1601,9 +1624,9 @@ def parse_args() -> argparse.Namespace:
             "  python vox.py movie.mkv --codec av1 --preset 8 --crf 30\n"
             "  python vox.py --images                   interactive TUI, compress images (AVIF or JPEG)\n"
             "  python vox.py --all --images --format jpeg --crf 3   every image → JPEG, no TUI\n"
-            "  python vox.py mk web                     create a preset named 'web' in .vox.json\n"
+            "  python vox.py mk web                     create a global preset named 'web'\n"
             "  python vox.py --use web                  convert the whole folder with preset 'web'\n"
-            "  python vox.py ls                         list presets in this folder\n"
+            "  python vox.py ls                         list global presets\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1634,10 +1657,10 @@ def cmd_mk(cwd: Path, encoders: set[str], name: str | None) -> int:
     try:
         save_presets(cwd, presets)
     except OSError as e:
-        print(f"{RED}Could not write {preset_path(cwd).name}: {e}{RESET}")
+        print(f"{RED}Could not write {preset_path()}: {e}{RESET}")
         return 1
     verb = "Updated" if existed else "Saved"
-    print(f"\n{GREEN}{verb} preset '{name}' → {preset_path(cwd).name}{RESET}")
+    print(f"\n{GREEN}{verb} preset '{name}' → {preset_path()}{RESET}")
     print(f"  {preset_label(settings)}")
     print(f"\nRun it with:  python vox.py --use {name}")
     return 0
@@ -1646,10 +1669,10 @@ def cmd_mk(cwd: Path, encoders: set[str], name: str | None) -> int:
 def cmd_ls(cwd: Path) -> int:
     presets = load_presets(cwd)
     if not presets:
-        print(f"{YELLOW}No presets in {cwd}.{RESET}")
+        print(f"{YELLOW}No global presets in {preset_path()}.{RESET}")
         print("Create one with:  python vox.py mk <name>")
         return 0
-    print(f"{BOLD}Presets in {preset_path(cwd).name}:{RESET}")
+    print(f"{BOLD}Global presets in {preset_path()}:{RESET}")
     width = max(len(n) for n in presets)
     for name in sorted(presets):
         print(f"  {name:<{width}}  {preset_label(presets[name])}")
@@ -1659,7 +1682,7 @@ def cmd_ls(cwd: Path) -> int:
 def cmd_rm(cwd: Path, name: str | None) -> int:
     presets = load_presets(cwd)
     if not presets:
-        print(f"{YELLOW}No presets in {cwd}.{RESET}")
+        print(f"{YELLOW}No global presets in {preset_path()}.{RESET}")
         return 1
     if name is None:
         print("Which preset? " + ", ".join(sorted(presets)))
@@ -1672,9 +1695,9 @@ def cmd_rm(cwd: Path, name: str | None) -> int:
         if presets:
             save_presets(cwd, presets)
         else:
-            preset_path(cwd).unlink(missing_ok=True)
+            preset_path().unlink(missing_ok=True)
     except OSError as e:
-        print(f"{RED}Could not update {preset_path(cwd).name}: {e}{RESET}")
+        print(f"{RED}Could not update {preset_path()}: {e}{RESET}")
         return 1
     print(f"{GREEN}Removed preset '{name}'.{RESET}")
     return 0
@@ -1690,7 +1713,7 @@ def main() -> int:
 
     cwd = Path.cwd()
 
-    # Preset subcommands act on the current folder's .vox.json and exit.
+    # Preset subcommands act on the global preset file and exit.
     if args.action in ("mk", "ls", "rm"):
         if args.use:
             print(f"{RED}--use cannot be combined with '{args.action}'.{RESET}")
@@ -1706,7 +1729,7 @@ def main() -> int:
     if args.use:
         presets = load_presets(cwd)
         if args.use not in presets:
-            print(f"{RED}No preset named '{args.use}' in {preset_path(cwd).name}.{RESET}")
+            print(f"{RED}No preset named '{args.use}' in {preset_path()}.{RESET}")
             if presets:
                 print("Available: " + ", ".join(sorted(presets)))
             else:
