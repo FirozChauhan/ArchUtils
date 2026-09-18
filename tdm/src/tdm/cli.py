@@ -271,6 +271,9 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         base_dir = Path(raw_dest).expanduser()
     else:
         base_dir = default_dest()  # honors XDG user-dirs.dirs, falls back to ~/Downloads
+    list_name = getattr(args, "list_name", "")
+    if list_name:
+        base_dir = base_dir / sanitize_list_name(list_name)
     if dest_dir and str(dest_dir) not in (".", ""):
         final = dest_dir.expanduser() / fname
     elif args.output and len(Path(args.output).expanduser().parts) > 1:
@@ -305,6 +308,8 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         "content_type": probe.content_type,
         "referer": referer,
     }
+    if getattr(args, "list_name", ""):
+        plan["list"] = args.list_name
 
     if args.dry_run:
         return plan
@@ -359,8 +364,13 @@ def main(argv=None) -> int:
         if len(args.urls) != 2:
             print("usage: tdm dl <list>", file=sys.stderr)
             return 2
+        if args.output:
+            print("error: -o/--output can't be used with dl <list> (use -d/--dest)", file=sys.stderr)
+            return 2
         try:
-            args.urls = load_list(args.urls[1])
+            list_name = sanitize_list_name(args.urls[1])
+            args.urls = load_list(list_name)
+            args.list_name = list_name
         except DownloadError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
