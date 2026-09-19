@@ -6,7 +6,7 @@ tdm - download files with browser impersonation, resume and segmentation
 
 # SYNOPSIS
 
-*tdm* [_OPTIONS_] _URL_ [_URL_ ...]
+*tdm* [_OPTIONS_] _URL_ [_URL_ ...] [_._]
 
 # OPTIONS
 
@@ -14,7 +14,10 @@ tdm - download files with browser impersonation, resume and segmentation
 	Output file. Default: auto from Content-Disposition / URL.
 
 *-d*, *--dest* _DIR_
-	Destination directory. Default ~/Downloads.
+	Destination directory. Default ~/Downloads. A trailing *.* positional
+	argument is shorthand for *-d .* (current directory).
+
+*tdm https://speed.hetzner.de/100MB.bin .*
 
 *-x*, *--max-connections* _N_
 	Max parallel Range connections (default 8, cap 16).

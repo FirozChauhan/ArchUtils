@@ -118,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tdm", description="Robust CLI download manager (browser impersonation, resume, segments)."
     )
-    p.add_argument("urls", nargs="*", help="URL(s) to download, or mk | ls | dl <list> | rm <list>")
+    p.add_argument("urls", nargs="*", help="URL(s) to download, or mk | ls | dl <list> | rm <list> (append ' .' to force cwd, e.g. tdm <url> .)")
     p.add_argument("-o", "--output", help="output file (default: auto from URL/Content-Disposition)")
     p.add_argument("-d", "--dest", help="destination directory (default ~/Downloads)")
     p.add_argument("-c", "--continue", dest="resume", action="store_true", help="resume .part if present (default: auto)")
@@ -348,6 +348,15 @@ def main(argv=None) -> int:
         else:
             print(f"exists: {p}", file=sys.stderr)
         return 0
+    # trailing '.' shortcut: `tdm <url> .` forces download into cwd
+    # (equivalent to `-d .`). Popped before subcommand/URL handling so
+    # it is never treated as a URL.
+    if args.urls and args.urls[-1] == ".":
+        if args.dest and args.dest != ".":
+            print("error: trailing '.' conflicts with -d/--dest", file=sys.stderr)
+            return 2
+        args.dest = "."
+        args.urls = args.urls[:-1]
     if not args.urls:
         parser.print_usage(sys.stderr)
         return 2
