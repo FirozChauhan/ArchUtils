@@ -24,13 +24,20 @@ IG_RE = re.compile(
     r"/(?:p|tv|reels?(?!/audio/))/(?P<id>[^/?#&]+)",
 )
 IG_SHARE_RE = re.compile(r"https?://(?:www\.)?instagr\.am/(?:p|reel)/(?P<id>[^/?#&]+)")
+SAVED_RE = re.compile(
+    r"https?://(?:www\.)?instagram\.com/(?P<user>[^/?#]+)/saved(?:/all-posts)?/?(?:[?#]|$)"
+)
 LSD_RE = re.compile(r'\["LSD",\[\],\{"token":"([^"]+)"')
 
 _ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 
 
 def is_instagram_url(url: str) -> bool:
-    return bool(IG_RE.search(url) or IG_SHARE_RE.search(url))
+    return bool(IG_RE.search(url) or IG_SHARE_RE.search(url) or SAVED_RE.search(url))
+
+
+def is_saved_url(url: str) -> bool:
+    return bool(SAVED_RE.search(url))
 
 
 def shortcode_from_url(url: str) -> str | None:
@@ -316,3 +323,112 @@ def resolve_instagram_media(page_url: str, impersonate: str = "chrome", cookies:
     if not shortcode:
         return []
     return _native_lookup(page_url, shortcode, impersonate, cookies, proxy, timeout)
+
+
+def _saved_headers(sess, lsd: str, csrf: str) -> dict:
+    h = {
+        "Accept": "*/*",
+        "X-CSRFToken": csrf,
+        "X-IG-App-ID": APP_ID,
+        "X-ASBD-ID": "129477",
+        "X-IG-WWW-Claim": "0",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": "https://www.instagram.com/",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
+    if lsd:
+        h["X-FB-LSD"] = lsd
+    return h
+
+
+def list_saved_posts(impersonate: str = "chrome", cookies: str = "",
+                     proxy: str = "", timeout: int = 30, limit: int = 0) -> list[dict]:
+    """List posts in the logged-in account's Saved collection.
+
+    Returns [{shortcode, username, taken_at}] in saved order (newest first).
+    Requires a logged-in session (``sessionid`` cookie) — raises RuntimeError
+    with a human message otherwise.
+    """
+    from .probe import make_session
+
+    if not cookies:
+        raise RuntimeError("saved collections need a logged-in session: pass --cookies")
+    sess = make_session(impersonate or "chrome", "", cookies, proxy, timeout)
+    try:
+        has_session = bool(sess.cookies.get("sessionid"))
+    except Exception:
+        has_session = False
+    if not has_session:
+        raise RuntimeError("no sessionid in cookies — re-export cookies.txt while logged in")
+
+    lsd, csrf = "", ""
+    try:
+        r = sess.get("https://www.instagram.com/", timeout=timeout)
+        lsd = (LSD_RE.search(r.text or "").group(1) if r.text else "") or ""
+        try:
+            csrf = sess.cookies.get("csrftoken") or ""
+        except Exception:
+            csrf = ""
+    except Exception as e:
+        LOG.debug("ig setup failed: %s", e)
+
+    posts: list[dict] = []
+    max_id: str | None = ""
+    while True:
+        params: dict = {"count": 50}
+        if max_id:
+            params["max_id"] = max_id
+        r = sess.get("https://www.instagram.com/api/v1/feed/saved/posts/",
+                     params=params, headers=_saved_headers(sess, lsd, csrf), timeout=timeout)
+        if r.status_code in (400, 401, 403):
+            raise RuntimeError(f"saved feed HTTP {r.status_code} — session rejected, re-export cookies")
+        if r.status_code != 200:
+            raise RuntimeError(f"saved feed HTTP {r.status_code}")
+        try:
+            data = r.json()
+        except Exception as e:
+            raise RuntimeError(f"saved feed returned non-JSON: {e}") from e
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError("unexpected saved feed shape (no items list)")
+        for entry in items:
+            media = (entry or {}).get("media") if isinstance(entry, dict) else None
+            if not isinstance(media, dict):
+                continue
+            code = media.get("code") or ""
+            user = media.get("user") or {}
+            posts.append({
+                "shortcode": str(code),
+                "username": str(user.get("username") or "") if isinstance(user, dict) else "",
+                "taken_at": media.get("taken_at") or 0,
+                "media": media,
+            })
+            if limit and len(posts) >= limit:
+                return posts
+        if not data.get("more_available"):
+            break
+        max_id = data.get("next_max_id") or ""
+        if not max_id:
+            break
+    return posts
+
+
+def resolve_saved_media(impersonate: str = "chrome", cookies: str = "",
+                        proxy: str = "", timeout: int = 30, limit: int = 0) -> list[IGMedia]:
+    """Resolve every post in Saved to direct media items (uses feed payloads,
+    no per-post lookup needed)."""
+    out: list[IGMedia] = []
+    for post in list_saved_posts(impersonate, cookies, proxy, timeout, limit=0):
+        media = post["media"]
+        code = post["shortcode"] or "post"
+        user = post["username"]
+        items = items_from_product_info(media, code, user) if code else []
+        if not items and isinstance(media.get("video_url"), str):
+            items = [IGMedia(url=_unescape_url(media["video_url"]), ext="mp4",
+                             filename=f"{user}_{code}.mp4" if user else f"{code}.mp4")]
+        out.extend(items)
+        if limit and len(out) >= limit:
+            return out[:limit]
+    return out

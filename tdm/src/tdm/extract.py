@@ -87,20 +87,29 @@ def _from_ytdlp_info(url: str, info: dict | None) -> list[Resolved]:
 
 
 def resolve_all(url: str, impersonate: str = "chrome", cookies: str = "",
-                proxy: str = "") -> list[Resolved]:
+                proxy: str = "", limit: int = 0) -> list[Resolved]:
     """Resolve a page URL to 1+ direct files. Instagram gets native handling
-    (anonymous GraphQL), everything else goes straight to yt-dlp.
-    Returns [] when nothing resolved."""
+    (anonymous GraphQL; Saved collections via the logged-in feed API),
+    everything else goes straight to yt-dlp. Returns [] when nothing resolved."""
     try:
-        from .instagram import img_index_from_url, is_instagram_url, resolve_instagram_media
+        from .instagram import (img_index_from_url, is_instagram_url, is_saved_url,
+                                resolve_instagram_media, resolve_saved_media)
     except ImportError:
         is_instagram_url = lambda u: False  # type: ignore
+        is_saved_url = lambda u: False  # type: ignore
         resolve_instagram_media = None  # type: ignore
+        resolve_saved_media = None  # type: ignore
         img_index_from_url = lambda u: None  # type: ignore
     if is_instagram_url(url):
         try:
-            items = resolve_instagram_media(url, impersonate=impersonate,
-                                            cookies=cookies, proxy=proxy) if resolve_instagram_media else []
+            if is_saved_url(url) and resolve_saved_media:
+                items = resolve_saved_media(impersonate=impersonate, cookies=cookies,
+                                            proxy=proxy, limit=limit)
+            else:
+                items = resolve_instagram_media(url, impersonate=impersonate,
+                                                cookies=cookies, proxy=proxy) if resolve_instagram_media else []
+        except RuntimeError:
+            raise
         except Exception:
             items = []
         if items:

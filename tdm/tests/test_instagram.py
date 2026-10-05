@@ -51,3 +51,20 @@ def test_ytdlp_playlist_expands():
     ]}
     out = _from_ytdlp_info("https://www.instagram.com/p/X/", info)
     assert [r.url for r in out] == ["https://cdn/1.mp4", "https://cdn/2.mp4"]
+
+
+def test_saved_url():
+    assert ig.is_saved_url("https://www.instagram.com/someuser/saved/")
+    assert ig.is_saved_url("https://www.instagram.com/someuser/saved/all-posts/")
+    assert not ig.is_saved_url("https://www.instagram.com/p/ABC123/")
+
+
+def test_saved_feed_parsing(monkeypatch=None):
+    # saved items wrap v1 media under "media" with code/user/carousel
+    media = {"code": "ABC1", "user": {"username": "poster"},
+             "carousel_media": [
+                 {"video_versions": [{"url": "https://cdn/1.mp4", "width": 720}]},
+                 {"image_versions2": {"candidates": [{"url": "https://cdn/2.jpg", "width": 1080}]}},
+             ]}
+    items = ig.items_from_product_info(media, "ABC1", "poster")
+    assert [m.filename for m in items] == ["poster_ABC1_1.mp4", "poster_ABC1_2.jpg"]

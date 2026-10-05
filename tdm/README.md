@@ -12,6 +12,8 @@ tdm --checksum sha256:<hex> -o out.iso https://example/file.iso
 tdm --dry-run -y "https://www.instagram.com/reel/<shortcode>/"
 tdm -y "https://www.instagram.com/p/<shortcode>/"
 tdm -y --cookies ~/cookies.txt "https://www.instagram.com/reel/<shortcode>/"
+# entire Saved collection (needs login cookies; --max-items caps file count)
+tdm -y --cookies ~/cookies.txt "https://www.instagram.com/<you>/saved/"
 ```
 
 Features: `curl_cffi` TLS/JA3 + HTTP/2 impersonation, Sec-Fetch headers,

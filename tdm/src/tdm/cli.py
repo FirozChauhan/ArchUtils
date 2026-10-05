@@ -126,6 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-x", "--max-connections", type=int, default=None, help="max connections (default 8)")
     p.add_argument("--min-split-size", default=None, help="min chunk size e.g. 1M (default 1M)")
     p.add_argument("--limit-rate", default=None, help="global speed cap e.g. 500K, 4.2M")
+    p.add_argument("--max-items", type=int, default=0, help="max files for Instagram Saved (0 = all)")
     p.add_argument("-y", "--yes", "--no-prompt", dest="no_prompt", action="store_true",
                    help="never prompt for filename, use server default")
     p.add_argument("--prompt", action="store_true",
@@ -353,10 +354,13 @@ def one(cfg: dict, args, raw_url: str) -> dict:
 
     # 1. resolve (yt-dlp + native Instagram) unless disabled
     items: list = []
+    max_items = getattr(args, "max_items", 0) or 0
     if not args.no_extract:
         try:
             items = resolve_all(raw_url, impersonate=impersonate, cookies=cookies,
-                                proxy=proxy)
+                                proxy=proxy, limit=max_items)
+        except RuntimeError as e:
+            raise DownloadError(str(e)) from e
         except Exception as e:
             LOG.debug("resolver failed, using raw url: %s", e)
     if not items:
@@ -365,8 +369,13 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         # save Instagram's logged-out JS shell (text/html), not the media.
         # Instagram gates datacenter IPs — user needs cookies.
         try:
-            from .instagram import is_instagram_url as _is_ig
+            from .instagram import is_instagram_url as _is_ig, is_saved_url as _is_sv
             if not args.no_extract and _is_ig(raw_url):
+                if _is_sv(raw_url) and not items:
+                    raise DownloadError(
+                        "Saved collection is empty or unreadable — check the /saved/ URL "
+                        "belongs to the logged-in account and cookies are fresh."
+                    )
                 raise DownloadError(
                     "Instagram blocked anonymous access for this post "
                     "(empty media response — GraphQL returned null). "
