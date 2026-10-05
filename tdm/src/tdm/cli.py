@@ -152,6 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-split-size", default=None, help="min chunk size e.g. 1M (default 1M)")
     p.add_argument("--limit-rate", default=None, help="global speed cap e.g. 500K, 4.2M")
     p.add_argument("--max-items", type=int, default=0, help="max files for Instagram Saved (0 = all)")
+    p.add_argument("--parallel", type=int, default=3, help="parallel file downloads for multi-file posts (default 3)")
     p.add_argument("-y", "--yes", "--no-prompt", dest="no_prompt", action="store_true",
                    help="never prompt for filename, use server default")
     p.add_argument("--prompt", action="store_true",
@@ -427,15 +428,41 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         r = items[0]
         return _fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url,
                              prefer_resolved=prefer)
-    # carousel / album: download each item, never prompt per file
+    # carousel / album / saved library: N files at a time, never prompt per file.
+    # Bars would garble across threads, so workers use plain progress.
+    import copy as _copy
+    from concurrent.futures import ThreadPoolExecutor as _Pool
+
     args.no_prompt = True
-    plans = []
-    for r in items:
-        plans.append(_fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url,
-                                   prefer_resolved=prefer))
+    workers = getattr(args, "parallel", 3) or 1
+    workers = max(1, min(workers, len(items)))
+    wargs = _copy.copy(args)
+    if not wargs.no_progress and not wargs.quiet and wargs.progress in (None, "bar"):
+        wargs.progress = "plain"
+    results: list = [None] * len(items)
+    with _Pool(max_workers=workers) as pool:
+        futs = {
+            pool.submit(_fetch_single, cfg, wargs, raw_url,
+                        r.url, r.filename, r.headers, r.page_url, prefer): i
+            for i, r in enumerate(items)
+        }
+        for fut in futs:
+            i = futs[fut]
+            try:
+                results[i] = fut.result()
+            except Exception as e:
+                LOG.error("%s [#%d]: %s", raw_url, i + 1, e)
+                results[i] = {"url": raw_url, "file": items[i].filename, "error": str(e)}
+    plans = [p for p in results if p and not p.get("error")]
+    failed = [p for p in results if p and p.get("error")]
+    if not plans:
+        raise DownloadError("; ".join(p["error"] for p in failed) or "all downloads failed")
     first = dict(plans[0])
     first["files"] = [p.get("done") or p.get("file") for p in plans]
     first["count"] = len(plans)
+    if failed:
+        first["failed_count"] = len(failed)
+        first["failed"] = [p.get("file") for p in failed]
     return first
 
 

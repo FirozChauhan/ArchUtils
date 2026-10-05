@@ -59,7 +59,49 @@ def test_saved_url():
     assert not ig.is_saved_url("https://www.instagram.com/p/ABC123/")
 
 
-def test_saved_feed_parsing(monkeypatch=None):
+def test_parallel_multi(monkeypatch=None):
+    import threading
+    import time
+    import types
+    from unittest.mock import patch
+
+    import tdm.cli as cli
+
+    cfg = {"network": {}, "general": {}, "output": {}}
+    args = types.SimpleNamespace(
+        impersonate=None, user_agent="", cookies="", cookies_from_browser="",
+        proxy="", timeout=30, retries=1, retry_delay=0.1, max_connections=2,
+        min_split_size="1M", limit_rate="", no_progress=True, progress=None,
+        quiet=True, referer="", no_extract=False, output=None, dest="/tmp",
+        no_prompt=False, dry_run=False, json=False, list_name="", checksum=None,
+        max_items=0, parallel=3,
+    )
+    items = [types.SimpleNamespace(url=f"https://cdn/{i}.mp4", filename=f"f{i}.mp4",
+                                   headers={}, page_url="https://www.instagram.com/p/X/")
+             for i in range(6)]
+    live = {"cur": 0, "max": 0}
+    lock = threading.Lock()
+
+    def fake_fetch(cfg_, args_, raw, dl, name, headers, page, prefer_resolved=False):
+        with lock:
+            live["cur"] += 1
+            live["max"] = max(live["max"], live["cur"])
+        try:
+            time.sleep(0.05)
+            return {"url": raw, "file": name, "done": name}
+        finally:
+            with lock:
+                live["cur"] -= 1
+
+    with patch.object(cli, "resolve_all", return_value=items), \
+         patch.object(cli, "_fetch_single", side_effect=fake_fetch):
+        plan = cli.one(cfg, args, "https://www.instagram.com/p/X/")
+    assert plan["count"] == 6
+    assert live["max"] > 1, f"expected concurrency, saw max {live['max']}"
+    assert live["max"] <= 3
+
+
+def test_saved_feed_parsing():
     # saved items wrap v1 media under "media" with code/user/carousel
     media = {"code": "ABC1", "user": {"username": "poster"},
              "carousel_media": [
