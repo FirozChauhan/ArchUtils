@@ -108,28 +108,65 @@ def _unescape_url(u: str) -> str:
     return u.replace("\\u0026", "&").replace("\\/", "/").strip()
 
 
+def _dims(c) -> tuple[int, int]:
+    try:
+        return int(c.get("width") or 0), int(c.get("height") or 0)
+    except (TypeError, ValueError, AttributeError):
+        return 0, 0
+
+
 def _best_video(cands: list[dict]) -> dict | None:
-    best, best_w = None, -1
+    """Largest-area video version (same content, different resolutions)."""
+    best, best_a = None, -1
     for c in cands:
         if not isinstance(c, dict):
             continue
         u = c.get("url")
         if not u or not str(u).startswith("http"):
             continue
-        w = c.get("width") or 0
-        try:
-            w = int(w)
-        except (TypeError, ValueError):
-            w = 0
-        if w >= best_w:
-            best, best_w = c, w
+        w, h = _dims(c)
+        a = w * h or w  # audio-only variants may lack height
+        if a > best_a:
+            best, best_a = c, a
     return best
+
+
+def _orig_dims(media: dict, fallback: tuple[int, int] = (0, 0)) -> tuple[int, int]:
+    try:
+        w, h = int(media.get("original_width") or 0), int(media.get("original_height") or 0)
+    except (TypeError, ValueError, AttributeError):
+        w, h = 0, 0
+    return (w, h) if w and h else fallback
+
+
+def _best_image(cands: list[dict], orig_w: int = 0, orig_h: int = 0) -> dict | None:
+    """Largest-area image, preferring the full-frame aspect over square crops.
+
+    Instagram ships profile-grid square crops (e.g. 1080x1080) alongside the
+    full image (e.g. 1080x1440); naive widest-wins grabs the cropped one.
+    """
+    valid = [c for c in cands
+             if isinstance(c, dict) and str(c.get("url") or "").startswith("http")]
+    if not valid:
+        return None
+
+    def _aspect(c) -> float:
+        w, h = _dims(c)
+        return (w / h) if h else 0.0
+
+    if orig_w and orig_h:
+        target = orig_w / orig_h
+        same = [c for c in valid if abs(_aspect(c) - target) < 0.02]
+        if same:
+            valid = same
+    return max(valid, key=lambda c: (_dims(c)[0] * _dims(c)[1]))
 
 
 def items_from_product_info(info: dict, shortcode: str, username: str = "") -> list[IGMedia]:
     """Parse Instagram v1-API / logged-out-GraphQL product dicts."""
     out: list[IGMedia] = []
     user = username or str(((info.get("user") or {}) if isinstance(info.get("user"), dict) else {}).get("username") or "")
+    ow, oh = _orig_dims(info)
 
     carousels = info.get("carousel_media")
     if isinstance(carousels, list) and carousels:
@@ -151,7 +188,7 @@ def items_from_product_info(info: dict, shortcode: str, username: str = "") -> l
             thumbs = ((m.get("image_versions2") or {}).get("candidates")
                       if isinstance(m.get("image_versions2"), dict) else None)
             if isinstance(thumbs, list) and thumbs:
-                best = _best_video(thumbs)
+                best = _best_image(thumbs, *_orig_dims(m, (ow, oh)))
                 if best:
                     out.append(IGMedia(url=_unescape_url(str(best["url"])), ext="jpg",
                                        filename=ig_filename(user, shortcode, "jpg", i)))
@@ -192,7 +229,7 @@ def items_from_product_info(info: dict, shortcode: str, username: str = "") -> l
     thumbs = ((info.get("image_versions2") or {}).get("candidates")
               if isinstance(info.get("image_versions2"), dict) else None)
     if isinstance(thumbs, list) and thumbs:
-        best = _best_video(thumbs)
+        best = _best_image(thumbs, ow, oh)
         if best:
             return [IGMedia(url=_unescape_url(str(best["url"])), ext="jpg",
                             filename=ig_filename(user, shortcode, "jpg"))]

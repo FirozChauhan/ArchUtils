@@ -59,6 +59,19 @@ def test_saved_url():
     assert not ig.is_saved_url("https://www.instagram.com/p/ABC123/")
 
 
+def test_best_image_skips_square_crop():
+    cands = [
+        {"url": "https://cdn/full.webp", "width": 1080, "height": 1440},
+        {"url": "https://cdn/crop.webp", "width": 1080, "height": 1080},
+        {"url": "https://cdn/small.webp", "width": 720, "height": 960},
+    ]
+    best = ig._best_image(cands, 1080, 1440)
+    assert best and best["url"] == "https://cdn/full.webp"
+    # no original dims: largest area still wins over the square crop
+    best2 = ig._best_image(cands)
+    assert best2 and best2["url"] == "https://cdn/full.webp"
+
+
 def test_parallel_multi(monkeypatch=None):
     import threading
     import time
