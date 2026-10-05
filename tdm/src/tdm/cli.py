@@ -114,11 +114,36 @@ def cmd_rm(name: str, no_prompt: bool = False) -> int:
     return 0
 
 
+def cmd_cookies(rest: list[str]) -> int:
+    from .config import set_config_value, store_cookies_file, stored_cookies_path
+
+    if not rest:
+        cfg = load_config(None)
+        cur = cfg["network"].get("cookies", "")
+        print(f"cookies: {cur or '(not set)'}", file=sys.stderr)
+        print(f"stored copy: {stored_cookies_path()}"
+              f"({'exists' if stored_cookies_path().exists() else 'missing'})", file=sys.stderr)
+        print("usage: tdm cookies <cookies.txt>  (stores it, uses it automatically)", file=sys.stderr)
+        return 0 if cur else 2
+    if len(rest) != 1:
+        print("usage: tdm cookies <cookies.txt>", file=sys.stderr)
+        return 2
+    try:
+        dest = store_cookies_file(rest[0])
+        cfg_path = set_config_value("network", "cookies", str(dest))
+    except FileNotFoundError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"stored cookies -> {dest} (mode 600)", file=sys.stderr)
+    print(f"config updated: {cfg_path}  ([network] cookies)", file=sys.stderr)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="tdm", description="Robust CLI download manager (browser impersonation, resume, segments)."
     )
-    p.add_argument("urls", nargs="*", help="URL(s) to download, or mk | ls | dl <list> | rm <list> (append ' .' to force cwd, e.g. tdm <url> .)")
+    p.add_argument("urls", nargs="*", help="URL(s) to download, or mk | ls | dl <list> | rm <list> | cookies [<file>] (append ' .' to force cwd, e.g. tdm <url> .)")
     p.add_argument("-o", "--output", help="output file (default: auto from URL/Content-Disposition)")
     p.add_argument("-d", "--dest", help="destination directory (default ~/Downloads)")
     p.add_argument("-c", "--continue", dest="resume", action="store_true", help="resume .part if present (default: auto)")
@@ -446,6 +471,8 @@ def main(argv=None) -> int:
         return cmd_mk()
     if args.urls[0] in ("ls", "lists") and len(args.urls) == 1:
         return cmd_ls()
+    if args.urls[0] == "cookies":
+        return cmd_cookies(args.urls[1:])
     if args.urls[0] == "rm":
         if len(args.urls) != 2:
             print("usage: tdm rm <list>", file=sys.stderr)

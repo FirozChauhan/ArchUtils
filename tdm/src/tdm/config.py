@@ -33,6 +33,68 @@ def xdg_config_file() -> Path:
     return Path(base).expanduser() / APP / "config.toml"
 
 
+def xdg_config_dir() -> Path:
+    return xdg_config_file().parent
+
+
+def stored_cookies_path() -> Path:
+    return xdg_config_dir() / "cookies.txt"
+
+
+def store_cookies_file(src: str) -> Path:
+    """Copy a Netscape cookies.txt into the XDG config dir (mode 600)."""
+    import shutil
+
+    origin = Path(src).expanduser()
+    if not origin.is_file():
+        raise FileNotFoundError(f"cookies file not found: {src}")
+    dest = stored_cookies_path()
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(origin, dest)
+    try:
+        os.chmod(dest, 0o600)
+    except OSError:
+        pass
+    return dest
+
+
+def set_config_value(section: str, key: str, value: str) -> Path:
+    """Set one `key = "value"` under `[section]` in the XDG config, preserving
+    other content. Creates the file/section if missing."""
+    path = xdg_config_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        text = ""
+    if not text.endswith("\n") and text:
+        text += "\n"
+    lines = text.splitlines(keepends=True) if text else []
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    new_line = f'{key} = "{escaped}"\n'
+    header = f"[{section}]"
+    idx = next((i for i, l in enumerate(lines) if l.strip() == header), None)
+    if idx is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(f"\n{header}\n{new_line}")
+    else:
+        end = next((i for i in range(idx + 1, len(lines))
+                    if lines[i].lstrip().startswith("[")), len(lines))
+        for i in range(idx + 1, end):
+            if lines[i].split("=", 1)[0].strip() == key:
+                lines[i] = new_line
+                break
+        else:
+            lines.insert(end, new_line)
+    path.write_text("".join(lines))
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
+
 def xdg_state_log() -> Path:
     base = os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
     return Path(base).expanduser() / APP / "tdm.log"
