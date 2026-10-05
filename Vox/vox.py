@@ -49,13 +49,18 @@ IMAGE_EXTENSIONS = frozenset({
 })
 
 # Image output formats. AVIF is AV1 still-image compression (needs an AV1 encoder
-# and the AVIF muxer); JPEG uses ffmpeg's built-in mjpeg encoder via image2, which
-# every ffmpeg build has.
+# and the AVIF muxer); WebP needs the libwebp encoder and stores alpha natively;
+# JPEG uses ffmpeg's built-in mjpeg encoder via image2, which every ffmpeg build has.
 IMAGE_FORMATS = {
     "avif": {
         "ext": ".avif",
         "encoder": None,            # chosen at runtime: libsvtav1 / libaom-av1
         "desc": "AVIF — best compression, newer apps/browsers only",
+    },
+    "webp": {
+        "ext": ".webp",
+        "encoder": "libwebp",
+        "desc": "WebP — broad support, keeps transparency, lossy only",
     },
     "jpeg": {
         "ext": ".jpg",
@@ -83,7 +88,7 @@ PRESET_FILE_NAME = "presets.json"
 LEGACY_PRESET_FILE_NAME = ".vox.json"
 
 # Preset targets: which conversion a saved preset describes.
-PRESET_TARGETS = ("video-hevc", "video-av1", "image-avif", "image-jpeg")
+PRESET_TARGETS = ("video-hevc", "video-av1", "image-avif", "image-webp", "image-jpeg")
 
 X265_PRESETS = [
     "ultrafast", "superfast", "veryfast", "faster", "fast",
@@ -104,6 +109,11 @@ AV1_CRF_MIN, AV1_CRF_MAX = 0, 63
 # because this is a "compress" tool and q:v 2 is still visually lossless-ish.
 JPEG_DEFAULT_CRF = 3
 JPEG_CRF_MIN, JPEG_CRF_MAX = 2, 31
+
+# WebP quality: libwebp -quality via ffmpeg's -q:v, 0 (worst) to 100 (best).
+# Lossy only — libwebp's lossless mode is not exposed here.
+WEBP_DEFAULT_CRF = 75
+WEBP_CRF_MIN, WEBP_CRF_MAX = 0, 100
 
 # pix_fmts that may carry a transparency channel — ffmpeg's AVIF muxer cannot
 # store alpha, so these are flattened onto a white background first.
@@ -396,18 +406,23 @@ def resolve_image_settings(
 ) -> tuple[str, str | None, str | None, int]:
     """Return (format, av1_encoder, preset, crf) for still-image compression.
 
-    format is 'avif' or 'jpeg'. For jpeg, av1_encoder and preset are None and
-    crf is an ffmpeg -q:v value (2-31, lower = better).
+    format is 'avif', 'webp' or 'jpeg'. For webp/jpeg, av1_encoder and preset
+    are None and crf is an ffmpeg -q:v value (webp: 0-100, higher = better;
+    jpeg: 2-31, lower = better).
     """
     av1_enc = pick_av1_encoder(encoders)
     avif_ok = av1_enc is not None and has_avif_muxer()
+    webp_ok = "libwebp" in encoders
 
     fmt = args.format
     if fmt is None:
-        options = []
+        available = []
         if avif_ok:
-            options.append(("1", "avif", IMAGE_FORMATS["avif"]["desc"]))
-        options.append(("2", "jpeg", IMAGE_FORMATS["jpeg"]["desc"]))
+            available.append(("avif", IMAGE_FORMATS["avif"]["desc"]))
+        if webp_ok:
+            available.append(("webp", IMAGE_FORMATS["webp"]["desc"]))
+        available.append(("jpeg", IMAGE_FORMATS["jpeg"]["desc"]))
+        options = [(str(i), f, d) for i, (f, d) in enumerate(available, 1)]
         if args.images and len(options) == 1:
             fmt = options[0][1]
             print(f"{YELLOW}Only {fmt.upper()} is available — using it.{RESET}")
@@ -425,20 +440,30 @@ def resolve_image_settings(
     if fmt == "avif":
         if not avif_ok:
             print(f"{RED}AVIF compression needs an AV1 encoder and the AVIF muxer, but this "
-                  f"ffmpeg build is missing one of them. Use --format jpeg instead.{RESET}")
+                  f"ffmpeg build is missing one of them. Use --format webp or jpeg instead.{RESET}")
             sys.exit(1)
         preset = prompt_preset("av1", av1_enc, args.preset)
         crf = prompt_crf("av1", args.crf)
         return fmt, av1_enc, preset, crf
 
+    if fmt == "webp":
+        if not webp_ok:
+            print(f"{RED}WebP compression needs the libwebp encoder, but this ffmpeg build "
+                  f"doesn't have it. Use --format jpeg instead.{RESET}")
+            sys.exit(1)
+        lo, hi, default = WEBP_CRF_MIN, WEBP_CRF_MAX, WEBP_DEFAULT_CRF
+        name, hint = "WebP", "(0 = worst, 100 = best; higher = better, bigger file)."
+    else:
+        lo, hi, default = JPEG_CRF_MIN, JPEG_CRF_MAX, JPEG_DEFAULT_CRF
+        name, hint = "JPEG", "(2 = best, 31 = worst; lower = better, bigger file)."
+
     q = args.crf
-    if q is not None and not (JPEG_CRF_MIN <= q <= JPEG_CRF_MAX):
-        print(f"{RED}JPEG quality (-q:v) must be between {JPEG_CRF_MIN} and {JPEG_CRF_MAX} "
-              f"(got {q}).{RESET}")
+    if q is not None and not (lo <= q <= hi):
+        print(f"{RED}{name} quality (-q:v) must be between {lo} and {hi} (got {q}).{RESET}")
         sys.exit(1)
     if q is None:
-        print(f"\n{BOLD}JPEG quality{RESET} (2 = best, 31 = worst; lower = better, bigger file).")
-    crf = q if q is not None else ask_int("Quality (-q:v)", JPEG_CRF_MIN, JPEG_CRF_MAX, JPEG_DEFAULT_CRF)
+        print(f"\n{BOLD}{name} quality{RESET} {hint}")
+    crf = q if q is not None else ask_int("Quality (-q:v)", lo, hi, default)
     return fmt, None, None, crf
 
 
@@ -511,7 +536,7 @@ def preset_label(settings: dict) -> str:
     if target.startswith("video"):
         detail = f"preset={settings.get('preset')}, CRF={settings.get('crf')}"
     else:
-        if target == "image-jpeg":
+        if target in ("image-jpeg", "image-webp"):
             detail = f"quality={settings.get('crf')}"
         else:
             detail = f"preset={settings.get('preset')}, CRF={settings.get('crf')}"
@@ -527,17 +552,21 @@ def build_preset_interactively(cwd: Path, encoders: set[str], name: str | None) 
     av1_enc = pick_av1_encoder(encoders)
     hevc_ok = "libx265" in encoders
     avif_ok = av1_enc is not None and has_avif_muxer()
+    webp_ok = "libwebp" in encoders
     jpeg_ok = "mjpeg" in encoders
 
-    options: list[tuple[str, str, str]] = []
+    candidates: list[tuple[str, str]] = []
     if hevc_ok:
-        options.append(("1", "video-hevc", "Video → HEVC (H.265)"))
+        candidates.append(("video-hevc", "Video → HEVC (H.265)"))
     if av1_enc:
-        options.append(("2", "video-av1", f"Video → AV1 ({av1_enc})"))
+        candidates.append(("video-av1", f"Video → AV1 ({av1_enc})"))
     if avif_ok:
-        options.append(("3", "image-avif", "Image → AVIF"))
+        candidates.append(("image-avif", "Image → AVIF"))
+    if webp_ok:
+        candidates.append(("image-webp", "Image → WebP"))
     if jpeg_ok:
-        options.append(("4", "image-jpeg", "Image → JPEG"))
+        candidates.append(("image-jpeg", "Image → JPEG"))
+    options = [(str(i), t, d) for i, (t, d) in enumerate(candidates, 1)]
     if not options:
         print(f"{RED}No usable encoder found — cannot create a preset.{RESET}")
         return None
@@ -561,6 +590,9 @@ def build_preset_interactively(cwd: Path, encoders: set[str], name: str | None) 
     elif target == "image-avif":
         settings["preset"] = prompt_preset("av1", av1_enc, None)
         settings["crf"] = prompt_crf("av1", None)
+    elif target == "image-webp":
+        print(f"\n{BOLD}WebP quality{RESET} (0 = worst, 100 = best; higher = better, bigger file).")
+        settings["crf"] = ask_int("Quality (-q:v)", WEBP_CRF_MIN, WEBP_CRF_MAX, WEBP_DEFAULT_CRF)
     else:  # image-jpeg
         print(f"\n{BOLD}JPEG quality{RESET} (2 = best, 31 = worst; lower = better, bigger file).")
         settings["crf"] = ask_int("Quality (-q:v)", JPEG_CRF_MIN, JPEG_CRF_MAX, JPEG_DEFAULT_CRF)
@@ -599,6 +631,8 @@ def apply_preset(args: argparse.Namespace, settings: dict, name: str) -> argpars
         codec = "av1"
     elif target == "image-avif":
         fmt = "avif"
+    elif target == "image-webp":
+        fmt = "webp"
     elif target == "image-jpeg":
         fmt = "jpeg"
     is_image = target.startswith("image")
@@ -889,6 +923,11 @@ def build_image_command(
         else:
             cmd += ["-cpu-used", preset, "-row-mt", "1"]
         cmd += ["-crf", str(crf), "-still-picture", "1", "-strict", "-2"]
+    elif fmt == "webp":
+        # WebP: libwebp stores alpha natively (yuva420p), so transparency is
+        # kept as-is — no flattening filter needed.
+        cmd += ["-c:v", IMAGE_FORMATS["webp"]["encoder"], "-q:v", str(crf)]
+        cmd += ["-f", "image2"]
     else:
         # JPEG: flatten any alpha (JPEG has no alpha channel) and set quality.
         if pix_fmt in MAY_HAVE_ALPHA_PIXFMTS:
@@ -924,7 +963,8 @@ def convert_image_core(
             return "exists", f"{out_path.name} already exists"
 
     pix_fmt = probe_pix_fmt(src)
-    flattened = pix_fmt in MAY_HAVE_ALPHA_PIXFMTS
+    # JPEG flattens alpha onto white; WebP keeps it, so only JPEG "flattens".
+    flattened = fmt != "webp" and pix_fmt in MAY_HAVE_ALPHA_PIXFMTS
     cmd = build_image_command(src, out_path, fmt, av1_encoder, preset, crf, pix_fmt)
     status, note = run_ffmpeg(cmd, None, src.name, progress)
     if status != "ok":
@@ -992,11 +1032,14 @@ class Tui:
             self.codec_options.append("hevc")
         if self.av1_enc:
             self.codec_options.append("av1")
-        # Image formats this build can write: AVIF needs an AV1 encoder + muxer;
-        # JPEG only needs the built-in mjpeg encoder, so it's always available.
+        # Image formats this build can write: AVIF needs an AV1 encoder + muxer,
+        # WebP needs the libwebp encoder, and JPEG only needs the built-in
+        # mjpeg encoder, so it's always available.
         self.image_format_options = []
         if self.av1_enc and self.avif_ok:
             self.image_format_options.append("avif")
+        if "libwebp" in encoders:
+            self.image_format_options.append("webp")
         self.image_format_options.append("jpeg")
         # Only offer modes that are possible AND have files in this folder,
         # so e.g. a folder of only images skips the mode screen entirely.
@@ -1032,7 +1075,7 @@ class Tui:
                 self.args.format if self.args.format in self.image_format_options
                 else self.image_format_options[0]
             )
-            self.codec = "av1" if self.image_format == "avif" else "jpeg"
+            self.codec = "av1" if self.image_format == "avif" else self.image_format
         else:
             self.codec = self.args.codec if self.args.codec in self.codec_options else self.codec_options[0]
         self._reset_for_codec()
@@ -1045,8 +1088,8 @@ class Tui:
     # -- setup ------------------------------------------------------------- #
 
     def _preset_list(self) -> list[str]:
-        if self.codec == "jpeg":
-            return []  # JPEG has no speed preset — only a quality value
+        if self.codec in ("jpeg", "webp"):
+            return []  # JPEG/WebP have no speed preset — only a quality value
         if self.codec == "hevc":
             return list(X265_PRESETS)
         if self.av1_enc == "libsvtav1":
@@ -1054,7 +1097,7 @@ class Tui:
         return [str(n) for n in range(AOM_PRESET_MIN, AOM_PRESET_MAX + 1)]
 
     def _default_preset(self) -> str:
-        if self.codec == "jpeg":
+        if self.codec in ("jpeg", "webp"):
             return ""
         if self.codec == "hevc":
             return X265_DEFAULT_PRESET
@@ -1063,6 +1106,8 @@ class Tui:
     def _default_crf(self) -> int:
         if self.codec == "jpeg":
             return JPEG_DEFAULT_CRF
+        if self.codec == "webp":
+            return WEBP_DEFAULT_CRF
         return X265_DEFAULT_CRF if self.codec == "hevc" else AV1_DEFAULT_CRF
 
     def _reset_for_codec(self):
@@ -1074,6 +1119,8 @@ class Tui:
         self.preset_idx = self.preset_list.index(self.preset) if self.preset_list else 0
         if self.codec == "jpeg":
             self.crf_lo, self.crf_hi = JPEG_CRF_MIN, JPEG_CRF_MAX
+        elif self.codec == "webp":
+            self.crf_lo, self.crf_hi = WEBP_CRF_MIN, WEBP_CRF_MAX
         elif self.codec == "hevc":
             self.crf_lo, self.crf_hi = X265_CRF_MIN, X265_CRF_MAX
         else:
@@ -1269,8 +1316,8 @@ class Tui:
                 if len(self.image_format_options) > 1 and self.args.format is None:
                     self.screen = "image_format"
                     self.cursor = self.image_format_options.index(self.image_format)
-                elif self.image_format == "jpeg":
-                    self.screen = "crf"  # JPEG has no preset step
+                elif self.image_format in ("jpeg", "webp"):
+                    self.screen = "crf"  # JPEG/WebP have no preset step
                 else:
                     self.screen = "preset"
                     self.cursor = self.preset_idx
@@ -1343,9 +1390,9 @@ class Tui:
             self.cursor = min(len(self.image_format_options) - 1, self.cursor + 1)
         elif key == "enter":
             self.image_format = self.image_format_options[self.cursor]
-            self.codec = "av1" if self.image_format == "avif" else "jpeg"
+            self.codec = "av1" if self.image_format == "avif" else self.image_format
             self._reset_for_codec()
-            if self.codec == "jpeg":
+            if self.codec in ("jpeg", "webp"):
                 self.screen = "crf"
             else:
                 self.screen = "preset"
@@ -1440,6 +1487,8 @@ class Tui:
         lo, hi = self.crf_lo, self.crf_hi
         if self.codec == "jpeg":
             hint = "JPEG -q:v: 2 (best) to 31 (worst)"
+        elif self.codec == "webp":
+            hint = "WebP -q:v: 0 (worst) to 100 (best)"
         elif self.codec == "hevc":
             hint = "HEVC: typical 18-28"
         else:
@@ -1448,8 +1497,12 @@ class Tui:
         span = hi - lo
         pos = int((self.crf - lo) / span * scale_w) if span else 0
         bar = "-" * pos + "▲" + "-" * max(0, scale_w - pos - 1)
-        title = ("JPEG quality (-q:v) — lower = better, bigger file" if self.codec == "jpeg"
-                 else "Quality (CRF) — lower = better, bigger file")
+        if self.codec == "jpeg":
+            title = "JPEG quality (-q:v) — lower = better, bigger file"
+        elif self.codec == "webp":
+            title = "WebP quality (-q:v) — higher = better, bigger file"
+        else:
+            title = "Quality (CRF) — lower = better, bigger file"
         lines = [
             self._title(title),
             "",
@@ -1475,7 +1528,7 @@ class Tui:
             self._run_conversions()
             self.screen = "done"
         elif key == "esc":
-            if self.mode == "image" and self.codec == "jpeg":
+            if self.mode == "image" and self.codec in ("jpeg", "webp"):
                 if len(self.image_format_options) > 1 and self.args.format is None:
                     self.screen = "image_format"
                     self.cursor = self.image_format_options.index(self.image_format)
@@ -1549,11 +1602,15 @@ class Tui:
     def _paint_convert(self):
         cols = shutil.get_terminal_size((80, 24)).columns
         if self.mode == "image":
-            codec_label = (f"AVIF ({self.av1_enc})" if self.image_format == "avif"
-                           else "JPEG (mjpeg)")
+            if self.image_format == "avif":
+                codec_label = f"AVIF ({self.av1_enc})"
+            elif self.image_format == "webp":
+                codec_label = "WebP (libwebp)"
+            else:
+                codec_label = "JPEG (mjpeg)"
         else:
             codec_label = "HEVC (x265)" if self.codec == "hevc" else f"AV1 ({self.av1_enc})"
-        if self.mode == "image" and self.image_format == "jpeg":
+        if self.mode == "image" and self.image_format in ("jpeg", "webp"):
             settings = f"quality {self.crf}"
         else:
             settings = f"preset {self.preset} · CRF {self.crf}"
@@ -1616,13 +1673,14 @@ class Tui:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="vox",
-        description="Convert videos to HEVC (H.265) or AV1, or compress images to AVIF/JPEG, with ffmpeg.",
+        description="Convert videos to HEVC (H.265) or AV1, or compress images to AVIF/WebP/JPEG, with ffmpeg.",
         epilog=(
             "examples:\n"
             "  python vox.py                            interactive TUI (mode → files → codec → preset → CRF)\n"
             "  python vox.py --all --codec hevc         convert every video to HEVC, no TUI\n"
             "  python vox.py movie.mkv --codec av1 --preset 8 --crf 30\n"
-            "  python vox.py --images                   interactive TUI, compress images (AVIF or JPEG)\n"
+            "  python vox.py --images                   interactive TUI, compress images (AVIF, WebP or JPEG)\n"
+            "  python vox.py --all --images --format webp --crf 80  every image → WebP, no TUI\n"
             "  python vox.py --all --images --format jpeg --crf 3   every image → JPEG, no TUI\n"
             "  python vox.py mk web                     create a global preset named 'web'\n"
             "  python vox.py --use web                  convert the whole folder with preset 'web'\n"
@@ -1630,7 +1688,7 @@ def parse_args() -> argparse.Namespace:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("action", nargs="?", choices=["mk", "ls", "rm"],
+    p.add_argument("action", nargs="?",
                    help="preset action: mk (create), ls (list), rm (delete)")
     p.add_argument("name", nargs="?", help="preset name for mk / rm")
     p.add_argument("--use", metavar="NAME", help="convert the whole folder using a saved preset")
@@ -1640,10 +1698,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--crf", type=int, help="quality: lower = better, bigger file (defaults: HEVC 24, AV1/AVIF 30)")
     p.add_argument("--all", action="store_true", help="convert every video in the folder without asking")
     p.add_argument("--images", action="store_true", help="compress images (AVIF or JPEG) instead of converting videos")
-    p.add_argument("--format", choices=["avif", "jpeg"], help="image output format (default: ask; AVIF if available)")
+    p.add_argument("--format", choices=["avif", "webp", "jpeg"], help="image output format (default: ask; AVIF if available)")
     p.add_argument("--force", action="store_true", help="overwrite files that already exist in Vox Output")
     p.add_argument("--copy-audio", action="store_true", help="copy the original audio stream instead of re-encoding to AAC")
-    return p.parse_args()
+    args = p.parse_args()
+    # A leading filename ("vox.py clip.mp4") lands in `action` because the
+    # preset subcommand is optional; move it into the file list so per-file
+    # conversion works instead of erroring on an invalid subcommand.
+    if args.action is not None and args.action not in ("mk", "ls", "rm"):
+        args.files.insert(0, args.action)
+        args.action = None
+    return args
 
 
 def cmd_mk(cwd: Path, encoders: set[str], name: str | None) -> int:
@@ -1792,6 +1857,8 @@ def main() -> int:
         ext = IMAGE_FORMATS[fmt]["ext"]
         if fmt == "avif":
             plan = f"AVIF ({av1_encoder}), preset={preset}, CRF={crf}"
+        elif fmt == "webp":
+            plan = f"WebP (libwebp), quality={crf}"
         else:
             plan = f"JPEG (mjpeg), quality={crf}"
         print(f"\n{BOLD}Plan:{RESET} {len(selected)} image(s) → {plan}")

@@ -1,6 +1,6 @@
 # Vox
 
-> Convert videos to HEVC (H.265) or AV1, and images to AVIF or JPEG, with ffmpeg — in the folder you're already standing in.
+> Convert videos to HEVC (H.265) or AV1, and images to AVIF, WebP or JPEG, with ffmpeg — in the folder you're already standing in.
 
 ![Python](https://img.shields.io/badge/Python-161B22?style=for-the-badge&logo=python&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-161B22?style=for-the-badge&logo=linux&logoColor=white)
@@ -20,7 +20,7 @@ Python 3.8+, stdlib only — nothing to `pip install`. The one external requirem
 ffmpeg -encoders | grep -E 'x265|svt|aom'   # check what your build supports
 ```
 
-HEVC needs `libx265`; AV1/AVIF need `libsvtav1` or `libaom-av1`, plus the AVIF muxer for images. Vox probes all of this at startup and refuses with install hints rather than crashing mid-batch.
+HEVC needs `libx265`; AV1/AVIF need `libsvtav1` or `libaom-av1`, plus the AVIF muxer for images; WebP needs `libwebp`. Vox probes all of this at startup and refuses with install hints rather than crashing mid-batch.
 
 ## Usage
 
@@ -29,6 +29,7 @@ python3 vox.py                                      # interactive TUI
 python3 vox.py --all --codec hevc                   # every video → HEVC, no prompts
 python3 vox.py movie.mkv --codec av1 --preset 8 --crf 30
 python3 vox.py --all --images --crf 34              # every image → AVIF
+python3 vox.py --all --images --format webp --crf 80 # every image → WebP
 python3 vox.py --all --images --format jpeg --crf 3 # every image → JPEG
 python3 vox.py clip.mp4 --copy-audio --force        # keep original audio, overwrite output
 
@@ -50,7 +51,7 @@ Results always land in a `Vox Output/` subfolder. Originals are never modified.
 | `--crf` | int | HEVC `24`, AV1/AVIF `30` | Quality — lower is better and bigger; clamped per codec |
 | `--all` | flag | — | Convert every matching file in the folder without asking |
 | `--images` | flag | — | Compress images instead of videos |
-| `--format` | `avif` \| `jpeg` | asks (AVIF if available) | Image output format |
+| `--format` | `avif` \| `webp` \| `jpeg` | asks (AVIF if available) | Image output format |
 | `--force` | flag | — | Overwrite files already present in `Vox Output` |
 | `--copy-audio` | flag | — | Stream-copy audio instead of re-encoding to AAC |
 | `--use` | `NAME` | — | Apply a saved preset to the whole folder |
@@ -69,14 +70,14 @@ python3 vox.py ls              # web  video-av1 (preset=8, CRF=30)
 python3 vox.py rm web
 ```
 
-A preset stores the target (`video-hevc`, `video-av1`, `image-avif`, `image-jpeg`), the encoder preset, the CRF/quality value, and optionally `copy_audio` / `force`. It never stores file lists — `--use` always processes the whole folder.
+A preset stores the target (`video-hevc`, `video-av1`, `image-avif`, `image-webp`, `image-jpeg`), the encoder preset, the CRF/quality value, and optionally `copy_audio` / `force`. It never stores file lists — `--use` always processes the whole folder.
 
 Explicit command-line flags always win over the preset, so `vox --use web --crf 34` uses the preset's codec/preset but your CRF. The file is plain JSON and safe to hand-edit; unknown keys and invalid targets are warned about and skipped rather than crashing a run.
 
 ```json
 {
   "web":   { "target": "video-av1",  "preset": "8", "crf": 30 },
-  "thumbs":{ "target": "image-jpeg", "crf": 4, "force": true }
+  "thumbs":{ "target": "image-webp", "crf": 80, "force": true }
 }
 ```
 
@@ -84,11 +85,11 @@ Explicit command-line flags always win over the preset, so `vox --use web --crf 
 
 - **Batch video conversion** — discovers videos by extension and confirms with ffprobe, then converts the whole selection in one run.
 - **HEVC and AV1** — roughly 50% smaller than H.264 for HEVC; AV1 compresses further for newer players.
-- **Image → AVIF or JPEG** — PNG, JPG, BMP, TIFF and WebP. AVIF (AV1 still-image) gives the best ratio; JPEG uses ffmpeg's built-in `mjpeg` encoder and works on every build, quality set with `-q:v` (2–31).
+- **Image → AVIF, WebP or JPEG** — PNG, JPG, BMP, TIFF and WebP inputs. AVIF (AV1 still-image) gives the best ratio; WebP needs the `libwebp` encoder, keeps transparency natively and uses libwebp's 0–100 quality; JPEG uses ffmpeg's built-in `mjpeg` encoder and works on every build, quality set with `-q:v` (2–31).
 - **One quality dialect** — x265 named presets, SVT-AV1 integers and AOM `cpu-used` values are all normalized to the same two prompts, with per-encoder range validation.
 - **Runtime capability detection** — queries `ffmpeg -encoders` / `-muxers` at startup, prefers SVT-AV1 over the far slower libaom, and only offers what can actually run.
 - **Loss-prevention guards** — skips sources already in the target codec and outputs that already exist, unless `--force`.
-- **Transparency flattening** — the AVIF muxer can't store alpha, so transparent images are composited onto white instead of encoding as garbage.
+- **Transparency flattening** — the AVIF muxer and JPEG can't store alpha, so transparent images are composited onto white instead of encoding as garbage; WebP keeps its alpha, so no flattening is applied there.
 - **Clean failure semantics** — a partial output is unlinked on any non-ok status, so `Vox Output` never accumulates corrupt files.
 - **Named presets** — `vox mk` saves a reusable target+quality bundle to the global `~/.config/vox/presets.json`; `vox --use <name>` runs it over the folder, and CLI flags override individual fields.
 - **Full-screen TUI** — arrow-key wizard (mode → files → codec/format → preset → CRF) with live per-file progress from ffmpeg's `-progress pipe:1`.
@@ -103,6 +104,7 @@ Explicit command-line flags always win over the preset, so `vox --use web --crf 
 | HEVC CRF | int | `24` | 0–51 |
 | AV1 preset | int | `8` (SVT) / `6` (AOM) | 0–13 / 0–11 |
 | AV1 + AVIF CRF | int | `30` | 0–63 |
+| WebP quality (`-q:v`) | int | `75` | 0–100 (higher = better) |
 | JPEG quality (`-q:v`) | int | `3` | 2–31 (lower = better) |
 | Preset file | path | `~/.config/vox/presets.json` | Global named presets (`vox mk`) |
 
@@ -129,8 +131,8 @@ flowchart TD
     C --> D[Probe source<br/>codec · duration · pix_fmt]
     D --> E{Guard<br/>already target codec? output exists?}
     E -- skip --> B
-    E -- pass --> F[ffmpeg encode<br/>x265 / SVT-AV1 / AOM / mjpeg]
-    F --> G[Vox Output/*.mp4 · *.avif · *.jpg]
+    E -- pass --> F[ffmpeg encode<br/>x265 / SVT-AV1 / AOM / libwebp / mjpeg]
+    F --> G[Vox Output/*.mp4 · *.avif · *.webp · *.jpg]
     F -- failure --> H[Unlink partial output]
 ```
 

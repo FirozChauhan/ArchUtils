@@ -12,7 +12,7 @@ from pathlib import Path
 from . import __version__
 from .config import SAMPLE, default_dest, load_config, xdg_config_file, xdg_state_log
 from .download import DownloadError, segmented_download
-from .extract import resolve
+from .extract import resolve, resolve_all
 from .probe import make_session, probe_url
 from .util import check_disk, filename_from_cd, human, notify, parse_size, sanitize_filename, verify_checksum
 
@@ -191,7 +191,8 @@ def setup_logging(verbose: int, quiet: bool, log_file: str = ""):
             LOG.warning("log file failed: %s", e)
 
 
-def one(cfg: dict, args, raw_url: str) -> dict:
+def _fetch_single(cfg: dict, args, raw_url: str, dl_url: str, resolved_name: str | None,
+                  headers_extra: dict, page_url: str) -> dict:
     net = cfg["network"]
     gen = cfg["general"]
     out = cfg["output"]
@@ -199,9 +200,6 @@ def one(cfg: dict, args, raw_url: str) -> dict:
     impersonate = args.impersonate if args.impersonate is not None else net.get("impersonate", "chrome")
     user_agent = args.user_agent or net.get("user_agent", "")
     cookies = args.cookies or net.get("cookies", "")
-    cfb = args.cookies_from_browser or net.get("cookies_from_browser", "")
-    if cfb and not cookies:
-        cookies = cookies_from_browser(cfb)
     proxy = args.proxy or net.get("proxy", "")
     timeout = args.timeout or net.get("timeout", 30)
     retries = args.retries if args.retries is not None else net.get("retries", 5)
@@ -211,21 +209,6 @@ def one(cfg: dict, args, raw_url: str) -> dict:
     limit_rate = args.limit_rate if args.limit_rate is not None else net.get("limit_rate", "")
     progress = "none" if args.no_progress else (args.progress or out.get("progress", "bar"))
     quiet = args.quiet or out.get("quiet", False)
-
-    # 1. resolve (yt-dlp) unless disabled
-    page_url = raw_url
-    headers_extra: dict = {}
-    resolved_name: str | None = None
-    dl_url = raw_url
-    if not args.no_extract:
-        try:
-            r = resolve(raw_url, impersonate=impersonate, cookies=cookies, proxy=proxy)
-            dl_url = r.url
-            resolved_name = r.filename
-            headers_extra = r.headers
-            page_url = r.page_url
-        except Exception as e:
-            LOG.debug("resolver failed, using raw url: %s", e)
 
     referer = args.referer or net.get("referer", "") or (page_url if page_url != dl_url else "")
 
@@ -243,6 +226,20 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         # probe discovered a working Referer (e.g. site hidden in acctoken);
         # the chunk fetches must send the same one or they get 403.
         referer = probe.referer
+
+    # Safety net: never save Instagram's login-wall HTML shell as the "file".
+    try:
+        from .instagram import is_instagram_url as _is_ig2
+        ct = (probe.content_type or "").lower()
+        if _is_ig2(raw_url) and dl_url == raw_url and ct.startswith("text/html"):
+            raise DownloadError(
+                "Instagram blocked anonymous access (got text/html login shell). "
+                "Re-run with --cookies ~/cookies.txt or --cookies-from-browser."
+            )
+    except DownloadError:
+        raise
+    except Exception:
+        pass
 
     # 3. filename
     if args.output:
@@ -330,6 +327,68 @@ def one(cfg: dict, args, raw_url: str) -> dict:
     plan["done"] = str(dest)
     plan["bytes"] = dest.stat().st_size
     return plan
+
+
+def one(cfg: dict, args, raw_url: str) -> dict:
+    net = cfg["network"]
+    impersonate = args.impersonate if args.impersonate is not None else net.get("impersonate", "chrome")
+    cookies = args.cookies or net.get("cookies", "")
+    cfb = args.cookies_from_browser or net.get("cookies_from_browser", "")
+    if cfb and not cookies:
+        cookies = cookies_from_browser(cfb)
+        args.cookies = cookies  # reuse for chunk fetches
+    if cookies:
+        # Fail early on a typo'd path instead of a confusing "blocked" error later.
+        from pathlib import Path as _P
+        if not _P(cookies).expanduser().exists():
+            raise DownloadError(f"cookies file not found: {cookies}")
+    proxy = args.proxy or net.get("proxy", "")
+
+    # 1. resolve (yt-dlp + native Instagram) unless disabled
+    items: list = []
+    if not args.no_extract:
+        try:
+            items = resolve_all(raw_url, impersonate=impersonate, cookies=cookies,
+                                proxy=proxy)
+        except Exception as e:
+            LOG.debug("resolver failed, using raw url: %s", e)
+    if not items:
+        from .extract import Resolved as _R
+        # Fail fast for Instagram: downloading the unresolved page would just
+        # save Instagram's logged-out JS shell (text/html), not the media.
+        # Instagram gates datacenter IPs — user needs cookies or an API instance.
+        try:
+            from .instagram import is_instagram_url as _is_ig
+            if not args.no_extract and _is_ig(raw_url):
+                raise DownloadError(
+                    "Instagram blocked anonymous access for this post "
+                    "(empty media response — GraphQL returned null). "
+                    + (f"Cookies were given ({args.cookies or net.get('cookies', '')}) but Instagram still "
+                       "refused — likely expired/missing sessionid. Re-export cookies.txt while logged in "
+                       "and check it contains an instagram.com sessionid line. "
+                       if cookies else "")
+                    + "Without cookies: pass --cookies ~/cookies.txt (Netscape format, exported while logged in) "
+                    "or --cookies-from-browser firefox|chrome."
+                )
+        except DownloadError:
+            raise
+        except Exception:
+            pass
+        items = [_R(url=raw_url, filename=None, headers={}, page_url=raw_url)]
+    if len(items) > 1 and args.output:
+        raise DownloadError("-o/--output can't be used with multi-file posts (carousel); use -d/--dest")
+    if len(items) == 1:
+        r = items[0]
+        return _fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url)
+    # carousel / album: download each item, never prompt per file
+    args.no_prompt = True
+    plans = []
+    for r in items:
+        plans.append(_fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url))
+    first = dict(plans[0])
+    first["files"] = [p.get("done") or p.get("file") for p in plans]
+    first["count"] = len(plans)
+    return first
 
 
 def main(argv=None) -> int:
