@@ -22,7 +22,7 @@ def test_product_info_video():
         {"video_versions": [{"url": "https://cdn/v.mp4", "width": 720, "height": 1280}],
          "user": {"username": "someone"}}, "ABC123")
     assert len(items) == 1 and items[0].url == "https://cdn/v.mp4"
-    assert items[0].filename == "someone_ABC123.mp4"
+    assert items[0].filename == "@someone --- ABC123.mp4"
 
 
 def test_product_info_carousel():
@@ -32,7 +32,7 @@ def test_product_info_carousel():
             {"image_versions2": {"candidates": [{"url": "https://cdn/2.jpg", "width": 1080}]}},
         ]}, "CAR1")
     assert [m.ext for m in items] == ["mp4", "jpg"]
-    assert items[0].filename == "CAR1_1.mp4"
+    assert items[0].filename == "@unknown --- CAR1_1.mp4"
 
 
 def test_html_fallback():
@@ -67,4 +67,4 @@ def test_saved_feed_parsing(monkeypatch=None):
                  {"image_versions2": {"candidates": [{"url": "https://cdn/2.jpg", "width": 1080}]}},
              ]}
     items = ig.items_from_product_info(media, "ABC1", "poster")
-    assert [m.filename for m in items] == ["poster_ABC1_1.mp4", "poster_ABC1_2.jpg"]
+    assert [m.filename for m in items] == ["@poster --- ABC1_1.mp4", "@poster --- ABC1_2.jpg"]

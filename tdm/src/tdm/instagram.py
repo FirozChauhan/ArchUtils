@@ -97,6 +97,13 @@ class IGMedia:
     height: int = 0
 
 
+def ig_filename(user: str, code: str, ext: str, idx: int | None = None) -> str:
+    """Human filenames: `@user --- CODE.jpg`, carousel items get `_N`."""
+    who = f"@{user}" if user else "@unknown"
+    stem = f"{who} --- {code}" + (f"_{idx}" if idx else "")
+    return f"{stem}.{ext}"
+
+
 def _unescape_url(u: str) -> str:
     return u.replace("\\u0026", "&").replace("\\/", "/").strip()
 
@@ -123,7 +130,6 @@ def items_from_product_info(info: dict, shortcode: str, username: str = "") -> l
     """Parse Instagram v1-API / logged-out-GraphQL product dicts."""
     out: list[IGMedia] = []
     user = username or str(((info.get("user") or {}) if isinstance(info.get("user"), dict) else {}).get("username") or "")
-    base = f"{user}_{shortcode}" if user else shortcode
 
     carousels = info.get("carousel_media")
     if isinstance(carousels, list) and carousels:
@@ -135,11 +141,12 @@ def items_from_product_info(info: dict, shortcode: str, username: str = "") -> l
                 best = _best_video(vids)
                 if best:
                     out.append(IGMedia(url=_unescape_url(str(best["url"])), ext="mp4",
-                                       filename=f"{base}_{i}.mp4",
+                                       filename=ig_filename(user, shortcode, "mp4", i),
                                        width=int(best.get("width") or 0), height=int(best.get("height") or 0)))
                     continue
             if isinstance(m.get("video_url"), str):
-                out.append(IGMedia(url=_unescape_url(m["video_url"]), ext="mp4", filename=f"{base}_{i}.mp4"))
+                out.append(IGMedia(url=_unescape_url(m["video_url"]), ext="mp4",
+                                   filename=ig_filename(user, shortcode, "mp4", i)))
                 continue
             thumbs = ((m.get("image_versions2") or {}).get("candidates")
                       if isinstance(m.get("image_versions2"), dict) else None)
@@ -147,10 +154,11 @@ def items_from_product_info(info: dict, shortcode: str, username: str = "") -> l
                 best = _best_video(thumbs)
                 if best:
                     out.append(IGMedia(url=_unescape_url(str(best["url"])), ext="jpg",
-                                       filename=f"{base}_{i}.jpg"))
+                                       filename=ig_filename(user, shortcode, "jpg", i)))
                     continue
             if isinstance(m.get("display_url"), str):
-                out.append(IGMedia(url=_unescape_url(m["display_url"]), ext="jpg", filename=f"{base}_{i}.jpg"))
+                out.append(IGMedia(url=_unescape_url(m["display_url"]), ext="jpg",
+                                   filename=ig_filename(user, shortcode, "jpg", i)))
         if out:
             return out
 
@@ -164,10 +172,10 @@ def items_from_product_info(info: dict, shortcode: str, username: str = "") -> l
                 continue
             if node.get("is_video") and isinstance(node.get("video_url"), str):
                 out.append(IGMedia(url=_unescape_url(node["video_url"]), ext="mp4",
-                                   filename=f"{base}_{i}.mp4"))
+                                   filename=ig_filename(user, shortcode, "mp4", i)))
             elif isinstance(node.get("display_url"), str):
                 out.append(IGMedia(url=_unescape_url(node["display_url"]), ext="jpg",
-                                   filename=f"{base}_{i}.jpg"))
+                                   filename=ig_filename(user, shortcode, "jpg", i)))
         if out:
             return out
 
@@ -176,19 +184,22 @@ def items_from_product_info(info: dict, shortcode: str, username: str = "") -> l
         best = _best_video(vids)
         if best:
             return [IGMedia(url=_unescape_url(str(best["url"])), ext="mp4",
-                            filename=f"{base}.mp4",
+                            filename=ig_filename(user, shortcode, "mp4"),
                             width=int(best.get("width") or 0), height=int(best.get("height") or 0))]
     if isinstance(info.get("video_url"), str):
-        return [IGMedia(url=_unescape_url(info["video_url"]), ext="mp4", filename=f"{base}.mp4")]
+        return [IGMedia(url=_unescape_url(info["video_url"]), ext="mp4",
+                        filename=ig_filename(user, shortcode, "mp4"))]
     thumbs = ((info.get("image_versions2") or {}).get("candidates")
               if isinstance(info.get("image_versions2"), dict) else None)
     if isinstance(thumbs, list) and thumbs:
         best = _best_video(thumbs)
         if best:
-            return [IGMedia(url=_unescape_url(str(best["url"])), ext="jpg", filename=f"{base}.jpg")]
+            return [IGMedia(url=_unescape_url(str(best["url"])), ext="jpg",
+                            filename=ig_filename(user, shortcode, "jpg"))]
     for key, ext in (("display_url", "jpg"), ("display_src", "jpg"), ("thumbnail_src", "jpg")):
         if isinstance(info.get(key), str):
-            return [IGMedia(url=_unescape_url(info[key]), ext=ext, filename=f"{base}.{ext}")]
+            return [IGMedia(url=_unescape_url(info[key]), ext=ext,
+                            filename=ig_filename(user, shortcode, ext))]
     return out
 
 
@@ -203,7 +214,8 @@ def items_from_html(html: str, shortcode: str) -> list[IGMedia]:
             return
         seen.add(u)
         seen_idx = len(seen)
-        found.append(IGMedia(url=u, ext=ext, filename=f"ig_{shortcode}_{seen_idx}.{ext}"))
+        found.append(IGMedia(url=u, ext=ext,
+                             filename=ig_filename("", shortcode, ext, seen_idx)))
 
     for m in re.finditer(r'"video_url"\s*:\s*"([^"]+)"', html):
         add(m.group(1), "mp4")
@@ -427,7 +439,7 @@ def resolve_saved_media(impersonate: str = "chrome", cookies: str = "",
         items = items_from_product_info(media, code, user) if code else []
         if not items and isinstance(media.get("video_url"), str):
             items = [IGMedia(url=_unescape_url(media["video_url"]), ext="mp4",
-                             filename=f"{user}_{code}.mp4" if user else f"{code}.mp4")]
+                             filename=ig_filename(user, code, "mp4"))]
         out.extend(items)
         if limit and len(out) >= limit:
             return out[:limit]
