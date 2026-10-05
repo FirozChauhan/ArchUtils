@@ -103,6 +103,48 @@ def sanitize_filename(name: str) -> str:
     return name[:200] or "file"
 
 
+_MIME_EXT = {
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "video/mp4": ".mp4",
+    "video/webm": ".webm",
+    "video/quicktime": ".mov",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+}
+
+
+def ext_from_content_type(ct: str | None) -> str | None:
+    """Map a Content-Type to a file extension (handles types mimetypes misses)."""
+    if not ct:
+        return None
+    base = ct.split(";")[0].strip().lower()
+    if base in _MIME_EXT:
+        return _MIME_EXT[base]
+    try:
+        import mimetypes
+
+        return mimetypes.guess_extension(base)
+    except Exception:
+        return None
+
+
+def with_correct_ext(fname: str, content_type: str | None) -> str:
+    """Swap fname's extension for the one matching content_type (jpg==jpeg)."""
+    want = ext_from_content_type(content_type)
+    if not want:
+        return fname
+    have = Path(fname).suffix.lower()
+    norm = {".jpeg": ".jpg", ".jpe": ".jpg", ".tif": ".tiff"}
+    if norm.get(have, have) == norm.get(want, want):
+        return fname
+    return str(Path(fname).with_suffix(want))
+
+
 def ensure_same_dir_part(final: Path) -> tuple[Path, Path]:
     part = final.with_name(final.name + ".part")
     state = final.with_name(final.name + ".part.json")

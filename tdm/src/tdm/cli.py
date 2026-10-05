@@ -192,7 +192,7 @@ def setup_logging(verbose: int, quiet: bool, log_file: str = ""):
 
 
 def _fetch_single(cfg: dict, args, raw_url: str, dl_url: str, resolved_name: str | None,
-                  headers_extra: dict, page_url: str) -> dict:
+                  headers_extra: dict, page_url: str, prefer_resolved: bool = False) -> dict:
     net = cfg["network"]
     gen = cfg["general"]
     out = cfg["output"]
@@ -245,6 +245,13 @@ def _fetch_single(cfg: dict, args, raw_url: str, dl_url: str, resolved_name: str
     if args.output:
         fname = sanitize_filename(Path(args.output).name)
         dest_dir = Path(args.output).expanduser().parent if len(Path(args.output).parts) > 1 else None
+    elif prefer_resolved and resolved_name:
+        # Extractor knows best (e.g. Instagram user_shortcode); the CDN's own
+        # basename is machine-like. Still correct the extension from Content-Type
+        # (IG serves heic for "photos").
+        from .util import with_correct_ext as _fixext
+        fname = sanitize_filename(_fixext(resolved_name, probe.content_type))
+        dest_dir = None
     else:
         fname = probe.filename or resolved_name or filename_from_cd(None, probe.final_url) or "file"
         fname = sanitize_filename(fname)
@@ -356,7 +363,7 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         from .extract import Resolved as _R
         # Fail fast for Instagram: downloading the unresolved page would just
         # save Instagram's logged-out JS shell (text/html), not the media.
-        # Instagram gates datacenter IPs — user needs cookies or an API instance.
+        # Instagram gates datacenter IPs — user needs cookies.
         try:
             from .instagram import is_instagram_url as _is_ig
             if not args.no_extract and _is_ig(raw_url):
@@ -377,14 +384,21 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         items = [_R(url=raw_url, filename=None, headers={}, page_url=raw_url)]
     if len(items) > 1 and args.output:
         raise DownloadError("-o/--output can't be used with multi-file posts (carousel); use -d/--dest")
+    try:
+        from .instagram import is_instagram_url as _is_ig3
+        prefer = _is_ig3(raw_url)
+    except Exception:
+        prefer = False
     if len(items) == 1:
         r = items[0]
-        return _fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url)
+        return _fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url,
+                             prefer_resolved=prefer)
     # carousel / album: download each item, never prompt per file
     args.no_prompt = True
     plans = []
     for r in items:
-        plans.append(_fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url))
+        plans.append(_fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url,
+                                   prefer_resolved=prefer))
     first = dict(plans[0])
     first["files"] = [p.get("done") or p.get("file") for p in plans]
     first["count"] = len(plans)
