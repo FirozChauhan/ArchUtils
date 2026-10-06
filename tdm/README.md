@@ -15,6 +15,9 @@ tdm -y "https://www.instagram.com/p/<shortcode>/"
 tdm cookies ~/cookies.txt
 # then no --cookies flag needed:
 tdm -y "https://www.instagram.com/p/<shortcode>/"
+# X posts (photos/GIFs/videos, original quality; no login needed)
+tdm -y "https://x.com/<user>/status/<id>"
+tdm -y "https://twitter.com/<user>/status/<id>/photo/2"  # 2nd photo only
 # entire Saved collection (needs login cookies; --max-items caps file count,
 # 3 files download in parallel, tune with --parallel N)
 tdm -y --cookies ~/cookies.txt "https://www.instagram.com/<you>/saved/"

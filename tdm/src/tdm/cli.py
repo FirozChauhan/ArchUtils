@@ -421,7 +421,8 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         raise DownloadError("-o/--output can't be used with multi-file posts (carousel); use -d/--dest")
     try:
         from .instagram import is_instagram_url as _is_ig3
-        prefer = _is_ig3(raw_url)
+        from .x import is_x_url as _is_x3
+        prefer = _is_ig3(raw_url) or _is_x3(raw_url)
     except Exception:
         prefer = False
     if len(items) == 1:
