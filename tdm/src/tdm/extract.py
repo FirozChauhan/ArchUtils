@@ -87,7 +87,7 @@ def _from_ytdlp_info(url: str, info: dict | None) -> list[Resolved]:
 
 
 def resolve_all(url: str, impersonate: str = "chrome", cookies: str = "",
-                proxy: str = "", limit: int = 0) -> list[Resolved]:
+                proxy: str = "", limit: int = 0, translate: bool = True) -> list[Resolved]:
     """Resolve a page URL to 1+ direct files. X posts go through the no-auth
     vxTwitter API, Instagram gets native handling (anonymous GraphQL; Saved
     collections via the logged-in feed API), everything else goes straight
@@ -108,7 +108,8 @@ def resolve_all(url: str, impersonate: str = "chrome", cookies: str = "",
         # vxTwitter API first (no auth, handles photos/GIFs); yt-dlp fallback.
         try:
             items = resolve_x_media(url, impersonate=impersonate,
-                                    cookies=cookies, proxy=proxy) if resolve_x_media else []
+                                    cookies=cookies, proxy=proxy,
+                                    translate=translate) if resolve_x_media else []
         except Exception:
             items = []
         if items:

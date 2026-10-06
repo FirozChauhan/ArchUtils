@@ -114,11 +114,18 @@ def _ext_for_image(url: str) -> str:
     return ext if ext in ("jpg", "jpeg", "png", "webp") else "jpg"
 
 
-def items_from_api(payload: dict, tid: str) -> tuple[str, str, list[dict]]:
-    """Parse vxTwitter JSON -> (screen_name, text, [{url, ext}]). Empty media
-    list when the tweet has no downloadable media."""
+def items_from_api(payload: dict, tid: str) -> tuple[str, str, str, list[dict]]:
+    """Parse vxTwitter JSON -> (screen_name, text, lang, [{url, ext}]). Empty
+    media list when the tweet has no downloadable media."""
     user = str(payload.get("user_screen_name") or "")
     text = str(payload.get("text") or "")
+    lang = str(payload.get("lang") or "")
+    explicit = payload.get("translation")
+    if isinstance(explicit, dict):
+        cand = explicit.get("text") or explicit.get("translatedText") or ""
+        if isinstance(cand, str) and cand.strip():
+            text = cand.strip()
+            lang = "en"
     out: list[dict] = []
     for m in payload.get("media_extended") or []:
         if not isinstance(m, dict):
@@ -132,11 +139,44 @@ def items_from_api(payload: dict, tid: str) -> tuple[str, str, list[dict]]:
         elif typ == "image":
             out.append({"url": upgrade_photo_url(url), "ext": _ext_for_image(url)})
         # unknown types ignored (polls, cards)
-    return user, text, out
+    return user, text, lang, out
+
+
+_TRANSLATE_CACHE: dict[str, str] = {}
+
+
+def translate_en(text: str, lang: str = "", timeout: int = 10) -> str:
+    """English filename text via MyMemory (free, no key). Never raises:
+    returns the original text when already English, on quota errors, or
+    on any failure."""
+    import urllib.request
+
+    t = (text or "").strip()
+    if not t or (lang or "").lower().startswith("en"):
+        return t
+    if t in _TRANSLATE_CACHE:
+        return _TRANSLATE_CACHE[t]
+    out = t
+    try:
+        src = (lang or "").split("-")[0].split("_")[0].lower() or "autodetect"
+        url = ("https://api.mymemory.translated.net/get?"
+               + _up.urlencode({"q": t[:450], "langpair": f"{src}|en"}))
+        req = urllib.request.Request(url, headers={"User-Agent": "tdm/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "ignore"))
+        if isinstance(data, dict) and data.get("responseStatus") == 200:
+            cand = ((data.get("responseData") or {}).get("translatedText") or "").strip()
+            bad = cand.upper().startswith(("MYMEMORY WARNING", "QUERY LENGTH", "INVALID"))
+            if cand and not bad and cand.lower() != t.lower():
+                out = cand
+    except Exception as e:
+        LOG.debug("translate failed, keeping original: %s", e)
+    _TRANSLATE_CACHE[t] = out
+    return out
 
 
 def _api_lookup(tid: str, impersonate: str, cookies: str, proxy: str,
-                timeout: int) -> tuple[str, str, list[dict]]:
+                timeout: int) -> tuple[str, str, str, list[dict]]:
     import urllib.request
 
     # NOTE: plain stdlib HTTPS on purpose — Cloudflare in front of the API
@@ -150,28 +190,29 @@ def _api_lookup(tid: str, impersonate: str, cookies: str, proxy: str,
         with urllib.request.urlopen(req, timeout=timeout or 30) as resp:
             if resp.status != 200:
                 LOG.debug("x api HTTP %s for %s", resp.status, tid)
-                return "", "", []
+                return "", "", "", []
             payload = json.loads(resp.read().decode("utf-8", "ignore"))
     except Exception as e:
         LOG.debug("x api failed for %s: %s", tid, e)
-        return "", "", []
+        return "", "", "", []
     if not isinstance(payload, dict):
-        return "", "", []
+        return "", "", "", []
     return items_from_api(payload, tid)
 
 
 def resolve_x_media(page_url: str, impersonate: str = "chrome", cookies: str = "",
-                    proxy: str = "", timeout: int = 30) -> list:
+                    proxy: str = "", timeout: int = 30, translate: bool = True) -> list:
     """Return [Resolved-like dicts] for an X status URL (may be empty)."""
     from .extract import Resolved
 
     tid = status_id_from_url(page_url)
     if not tid:
         return []
-    user, text, items = _api_lookup(tid, impersonate, cookies, proxy, timeout)
+    user, text, lang, items = _api_lookup(tid, impersonate, cookies, proxy, timeout)
     if not items:
         return []
     user = user or user_from_url(page_url)
+    text = translate_en(text, lang) if translate else text.strip()
     numbered = [(i if len(items) > 1 else None, m) for i, m in enumerate(items, 1)]
     sel = x_index_from_url(page_url)
     if sel:

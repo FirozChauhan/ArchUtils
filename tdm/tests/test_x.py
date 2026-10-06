@@ -32,7 +32,8 @@ def test_api_parsing_mixed():
             {"type": "poll", "url": "https://x.com/i/poll/1"},
         ],
     }
-    user, text, items = X.items_from_api(payload, "1577855540407197696")
+    user, text, lang, items = X.items_from_api(payload, "1577855540407197696")
+    assert lang == ""
     assert text == ""
     assert user == "oshtru"
     assert [(m["ext"]) for m in items] == ["jpg", "mp4"]
@@ -43,14 +44,14 @@ def test_api_parsing_gif():
     payload = {"user_screen_name": "Rizdraws", "text": "lol",
                "media_extended": [{"type": "gif",
                                    "url": "https://video.twimg.com/tweet_video/Fdw7SzOXwAQQ-fA.mp4"}]}
-    user, text, items = X.items_from_api(payload, "1")
+    user, text, lang, items = X.items_from_api(payload, "1")
     assert text == "lol"
     assert items == [{"url": "https://video.twimg.com/tweet_video/Fdw7SzOXwAQQ-fA.mp4", "ext": "mp4"}]
 
 
 def test_api_empty_and_missing():
-    assert X.items_from_api({"user_screen_name": "u"}, "1") == ("u", "", [])
-    assert X.items_from_api({}, "1") == ("", "", [])
+    assert X.items_from_api({"user_screen_name": "u"}, "1") == ("u", "", "", [])
+    assert X.items_from_api({}, "1") == ("", "", "", [])
 
 
 def test_filenames():
@@ -70,6 +71,49 @@ def test_clean_text():
     assert X.clean_text("", 50) == ""
     full = X.x_filename("u", "1" * 19, "mp4", text="w" * 500)
     assert len(full) <= 200 and full.endswith(".mp4")
+
+
+def test_translate_en():
+    import json
+    from unittest.mock import patch
+
+    assert X.translate_en("hello", "en") == "hello"  # no HTTP for English
+    assert X.translate_en("", "pt") == ""
+
+    body = json.dumps({"responseStatus": 200,
+                       "responseData": {"translatedText": "Next season promises to be even better"}})
+
+    class R:
+        status = 200
+
+        def read(self):
+            return body.encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    with patch("urllib.request.urlopen", return_value=R()) as m:
+        assert X.translate_en("A próxima temporada promete", "pt") == \
+            "Next season promises to be even better"
+        assert m.call_count == 1
+        X.translate_en("A próxima temporada promete", "pt")  # cached
+        assert m.call_count == 1
+
+    bad = json.dumps({"responseStatus": 200,
+                      "responseData": {"translatedText": "MYMEMORY WARNING: quota"}})
+
+    class R2(R):
+        def read(self):
+            return bad.encode()
+
+    with patch("urllib.request.urlopen", return_value=R2()):
+        assert X.translate_en("bonjour le monde", "fr") == "bonjour le monde"
+
+    with patch("urllib.request.urlopen", side_effect=Exception("down")):
+        assert X.translate_en("hola mundo", "es") == "hola mundo"
 
 
 def test_index_filtering(monkeypatch=None):

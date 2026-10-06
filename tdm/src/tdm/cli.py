@@ -153,6 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit-rate", default=None, help="global speed cap e.g. 500K, 4.2M")
     p.add_argument("--max-items", type=int, default=0, help="max files for Instagram Saved (0 = all)")
     p.add_argument("--parallel", type=int, default=3, help="parallel file downloads for multi-file posts (default 3)")
+    p.add_argument("--no-translate", action="store_true", help="keep original language in X filenames")
     p.add_argument("-y", "--yes", "--no-prompt", dest="no_prompt", action="store_true",
                    help="never prompt for filename, use server default")
     p.add_argument("--prompt", action="store_true",
@@ -381,10 +382,11 @@ def one(cfg: dict, args, raw_url: str) -> dict:
     # 1. resolve (yt-dlp + native Instagram) unless disabled
     items: list = []
     max_items = getattr(args, "max_items", 0) or 0
+    do_translate = not getattr(args, "no_translate", False)
     if not args.no_extract:
         try:
             items = resolve_all(raw_url, impersonate=impersonate, cookies=cookies,
-                                proxy=proxy, limit=max_items)
+                                proxy=proxy, limit=max_items, translate=do_translate)
         except RuntimeError as e:
             raise DownloadError(str(e)) from e
         except Exception as e:
