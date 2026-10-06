@@ -51,19 +51,22 @@ def x_index_from_url(url: str) -> tuple[str, int] | None:
 
 def x_filename(user: str, tid: str, ext: str, idx: int | None = None,
                text: str = "") -> str:
-    """Human filenames: `@user --- 123 --- some words.mp4`.
+    """Human filenames: `@user --- some words.mp4`, id only when textless.
 
     Text is cleaned (links/entities/extra whitespace out) and truncated to
-    fit the 200-char filename cap, id kept intact so names stay unique.
-    Multi-media posts keep their `_N` slot after the id.
+    fit the 200-char filename cap. Multi-media posts keep a `_N` slot.
+    Textless posts fall back to `@user --- 123[_N].mp4` so names stay unique.
     """
     who = f"@{user}" if user else "@unknown"
-    base = f"{who} --- {tid}" + (f"_{idx}" if idx else "")
-    snippet = clean_text(text, budget=max(0, 200 - len(base) - len(" --- ") - len(f".{ext}")))
-    name = base + (f" --- {snippet}" if snippet else "") + f".{ext}"
+    slot = f"_{idx}" if idx else ""
+    fixed = len(who) + len(" --- ") + len(slot) + len(f".{ext}")
+    snippet = clean_text(text, budget=max(0, 200 - fixed))
+    stem = f"{who} --- {snippet}{slot}" if snippet else f"{who} --- {tid}{slot}"
+    name = f"{stem}.{ext}"
     while len(name.encode("utf-8")) > 240 and snippet:
         snippet = snippet[:-1].rstrip(" -_.,!?:;")
-        name = base + (f" --- {snippet}" if snippet else "") + f".{ext}"
+        stem = f"{who} --- {snippet}{slot}" if snippet else f"{who} --- {tid}{slot}"
+        name = f"{stem}.{ext}"
     return name
 
 

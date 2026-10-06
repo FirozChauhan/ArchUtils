@@ -57,7 +57,9 @@ def test_filenames():
     assert X.x_filename("NASA", "123", "mp4") == "@NASA --- 123.mp4"
     assert X.x_filename("NASA", "123", "jpg", 2) == "@NASA --- 123_2.jpg"
     assert X.x_filename("", "123", "jpg", 1) == "@unknown --- 123_1.jpg"
-    assert X.x_filename("u", "1", "mp4", text="hello world") == "@u --- 1 --- hello world.mp4"
+    assert X.x_filename("u", "1", "mp4", text="hello world") == "@u --- hello world.mp4"
+    assert X.x_filename("u", "1", "jpg", 2, text="hi") == "@u --- hi_2.jpg"
+    assert X.x_filename("u", "1" * 19, "mp4") == "@u --- " + "1" * 19 + ".mp4"
 
 
 def test_clean_text():
