@@ -49,11 +49,40 @@ def x_index_from_url(url: str) -> tuple[str, int] | None:
     return None
 
 
-def x_filename(user: str, tid: str, ext: str, idx: int | None = None) -> str:
-    """Human filenames: `@user --- 12345.mp4`, multi-media gets `_N`."""
+def x_filename(user: str, tid: str, ext: str, idx: int | None = None,
+               text: str = "") -> str:
+    """Human filenames: `@user --- 123 --- some words.mp4`.
+
+    Text is cleaned (links/entities/extra whitespace out) and truncated to
+    fit the 200-char filename cap, id kept intact so names stay unique.
+    Multi-media posts keep their `_N` slot after the id.
+    """
     who = f"@{user}" if user else "@unknown"
-    stem = f"{who} --- {tid}" + (f"_{idx}" if idx else "")
-    return f"{stem}.{ext}"
+    base = f"{who} --- {tid}" + (f"_{idx}" if idx else "")
+    snippet = clean_text(text, budget=max(0, 200 - len(base) - len(" --- ") - len(f".{ext}")))
+    name = base + (f" --- {snippet}" if snippet else "") + f".{ext}"
+    while len(name.encode("utf-8")) > 240 and snippet:
+        snippet = snippet[:-1].rstrip(" -_.,!?:;")
+        name = base + (f" --- {snippet}" if snippet else "") + f".{ext}"
+    return name
+
+
+def clean_text(text: str, budget: int) -> str:
+    """Collapse a post's text to a filename-safe snippet within budget chars."""
+    import html as _h
+
+    t = _h.unescape(text or "")
+    t = re.sub(r"https?://\S+", "", t)
+    t = t.replace("\n", " ").replace("\r", " ")
+    t = re.sub(r'[<>:"|?*]', "", t)
+    t = re.sub(r"\s+", " ", t).strip(" -_.,!?:;")
+    if budget <= 0:
+        return ""
+    if len(t) > budget:
+        cut = t[:budget].rsplit(" ", 1)
+        t = cut[0] if len(cut) > 1 and len(cut[0]) >= budget // 2 else t[:budget]
+        t = t.rstrip(" -_.,!?:;")
+    return t
 
 
 def upgrade_photo_url(url: str) -> str:
@@ -82,10 +111,11 @@ def _ext_for_image(url: str) -> str:
     return ext if ext in ("jpg", "jpeg", "png", "webp") else "jpg"
 
 
-def items_from_api(payload: dict, tid: str) -> tuple[str, list[dict]]:
-    """Parse vxTwitter JSON -> (screen_name, [{url, ext}]). Empty list when
-    the tweet has no downloadable media."""
+def items_from_api(payload: dict, tid: str) -> tuple[str, str, list[dict]]:
+    """Parse vxTwitter JSON -> (screen_name, text, [{url, ext}]). Empty media
+    list when the tweet has no downloadable media."""
     user = str(payload.get("user_screen_name") or "")
+    text = str(payload.get("text") or "")
     out: list[dict] = []
     for m in payload.get("media_extended") or []:
         if not isinstance(m, dict):
@@ -99,11 +129,11 @@ def items_from_api(payload: dict, tid: str) -> tuple[str, list[dict]]:
         elif typ == "image":
             out.append({"url": upgrade_photo_url(url), "ext": _ext_for_image(url)})
         # unknown types ignored (polls, cards)
-    return user, out
+    return user, text, out
 
 
 def _api_lookup(tid: str, impersonate: str, cookies: str, proxy: str,
-                timeout: int) -> tuple[str, list[dict]]:
+                timeout: int) -> tuple[str, str, list[dict]]:
     import urllib.request
 
     # NOTE: plain stdlib HTTPS on purpose — Cloudflare in front of the API
@@ -117,13 +147,13 @@ def _api_lookup(tid: str, impersonate: str, cookies: str, proxy: str,
         with urllib.request.urlopen(req, timeout=timeout or 30) as resp:
             if resp.status != 200:
                 LOG.debug("x api HTTP %s for %s", resp.status, tid)
-                return "", []
+                return "", "", []
             payload = json.loads(resp.read().decode("utf-8", "ignore"))
     except Exception as e:
         LOG.debug("x api failed for %s: %s", tid, e)
-        return "", []
+        return "", "", []
     if not isinstance(payload, dict):
-        return "", []
+        return "", "", []
     return items_from_api(payload, tid)
 
 
@@ -135,7 +165,7 @@ def resolve_x_media(page_url: str, impersonate: str = "chrome", cookies: str = "
     tid = status_id_from_url(page_url)
     if not tid:
         return []
-    user, items = _api_lookup(tid, impersonate, cookies, proxy, timeout)
+    user, text, items = _api_lookup(tid, impersonate, cookies, proxy, timeout)
     if not items:
         return []
     user = user or user_from_url(page_url)
@@ -149,7 +179,7 @@ def resolve_x_media(page_url: str, impersonate: str = "chrome", cookies: str = "
             numbered = [pool[idx - 1]]
     return [Resolved(
         url=m["url"],
-        filename=x_filename(user, tid, m["ext"], i),
+        filename=x_filename(user, tid, m["ext"], i, text),
         headers={},
         page_url=page_url,
     ) for i, m in numbered]

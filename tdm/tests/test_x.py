@@ -32,29 +32,42 @@ def test_api_parsing_mixed():
             {"type": "poll", "url": "https://x.com/i/poll/1"},
         ],
     }
-    user, items = X.items_from_api(payload, "1577855540407197696")
+    user, text, items = X.items_from_api(payload, "1577855540407197696")
+    assert text == ""
     assert user == "oshtru"
     assert [(m["ext"]) for m in items] == ["jpg", "mp4"]
     assert "name=orig" in items[0]["url"]
 
 
 def test_api_parsing_gif():
-    payload = {"user_screen_name": "Rizdraws",
+    payload = {"user_screen_name": "Rizdraws", "text": "lol",
                "media_extended": [{"type": "gif",
                                    "url": "https://video.twimg.com/tweet_video/Fdw7SzOXwAQQ-fA.mp4"}]}
-    user, items = X.items_from_api(payload, "1")
+    user, text, items = X.items_from_api(payload, "1")
+    assert text == "lol"
     assert items == [{"url": "https://video.twimg.com/tweet_video/Fdw7SzOXwAQQ-fA.mp4", "ext": "mp4"}]
 
 
 def test_api_empty_and_missing():
-    assert X.items_from_api({"user_screen_name": "u"}, "1") == ("u", [])
-    assert X.items_from_api({}, "1") == ("", [])
+    assert X.items_from_api({"user_screen_name": "u"}, "1") == ("u", "", [])
+    assert X.items_from_api({}, "1") == ("", "", [])
 
 
 def test_filenames():
     assert X.x_filename("NASA", "123", "mp4") == "@NASA --- 123.mp4"
     assert X.x_filename("NASA", "123", "jpg", 2) == "@NASA --- 123_2.jpg"
     assert X.x_filename("", "123", "jpg", 1) == "@unknown --- 123_1.jpg"
+    assert X.x_filename("u", "1", "mp4", text="hello world") == "@u --- 1 --- hello world.mp4"
+
+
+def test_clean_text():
+    assert X.clean_text("a  b\nc https://t.co/xyz #tag", 100) == "a b c #tag"
+    assert X.clean_text("x" * 300, 10) == "x" * 10
+    got = X.clean_text(("word " * 100).strip(), 20)
+    assert len(got) <= 20 and not got.endswith(" ")
+    assert X.clean_text("", 50) == ""
+    full = X.x_filename("u", "1" * 19, "mp4", text="w" * 500)
+    assert len(full) <= 200 and full.endswith(".mp4")
 
 
 def test_index_filtering(monkeypatch=None):
