@@ -222,6 +222,27 @@ def origin_of(url: str) -> str:
 
 
 _DOMAIN_RE = re.compile(r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
+_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_IPV6_RE = re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,}[0-9A-Fa-f:.]{2,}\b")
+
+
+def _decoded_texts(value: str) -> list[str]:
+    """Raw query value plus its base64-decoded form (standard + urlsafe,
+    missing padding tolerated), when the decoded form looks like text."""
+    out = [value]
+    v = value.strip()
+    for alt in (False, True):
+        try:
+            pad = "=" * (-len(v) % 4)
+            raw = base64.b64decode(v + pad, altchars=b"-_" if alt else None,
+                                   validate=False)
+            text = raw.decode("utf-8", errors="ignore")
+            if text and all(32 <= ord(c) < 127 or c in "\t" for c in text[:512]):
+                out.append(text)
+                break
+        except Exception:
+            continue
+    return out
 
 
 def _decoded_domains(value: str) -> list[str]:
@@ -231,21 +252,7 @@ def _decoded_domains(value: str) -> list[str]:
     embedding site inside an opaque token such as acctoken=<b64(...|site|...)>.
     """
     found: list[str] = []
-    candidates = [value]
-    v = value.strip()
-    # try base64 (standard + urlsafe, missing padding tolerated)
-    for alt in (False, True):
-        try:
-            pad = "=" * (-len(v) % 4)
-            raw = base64.b64decode(v + pad, altchars=b"-_" if alt else None,
-                                   validate=False)
-            text = raw.decode("utf-8", errors="ignore")
-            if text and all(32 <= ord(c) < 127 or c in "\t" for c in text[:512]):
-                candidates.append(text)
-                break
-        except Exception:
-            continue
-    for text in candidates:
+    for text in _decoded_texts(value):
         for m in _DOMAIN_RE.finditer(text):
             start, end = m.start(), m.end()
             # skip matches that are a prefix of a longer alnum token
@@ -258,6 +265,60 @@ def _decoded_domains(value: str) -> list[str]:
             if "." in host and host not in found:
                 found.append(host)
     return found
+
+
+def token_ips(url: str) -> list[str]:
+    """IP addresses embedded in a URL's query tokens (raw or base64-decoded).
+
+    Hotlink tokens often bind the link to the client IP they were issued for
+    (e.g. acctoken=<b64(...|2405:201:...|...)>); such links 403 from any other
+    network no matter the Referer.
+    """
+    found: list[str] = []
+    try:
+        q = urlparse(url).query
+        for _, val in parse_qsl(q, keep_blank_values=True):
+            if not val or len(val) < 4:
+                continue
+            for text in _decoded_texts(val):
+                for rx in (_IPV4_RE, _IPV6_RE):
+                    for m in rx.finditer(text):
+                        ip = m.group(0).strip(".:")
+                        if ip and ip not in found:
+                            found.append(ip)
+    except Exception:
+        pass
+    return found
+
+
+def ip_lock_hint(url: str) -> str | None:
+    """Specific hint when a token-bound IP can never match this machine's
+    route to the host (e.g. token binds IPv6 while the CDN host is
+    IPv4-only). Returns None when families overlap or can't be determined."""
+    ips = token_ips(url)
+    if not ips:
+        return None
+    try:
+        import socket
+
+        host = urlparse(url).netloc.rsplit(":", 1)[0]
+        fams = {"v6" if fam == socket.AF_INET6 else "v4"
+                for fam, *_ in socket.getaddrinfo(host, None)}
+    except Exception:
+        return None
+    if not fams:
+        return None
+    locked = {("v6" if ":" in ip else "v4") for ip in ips}
+    if locked & fams:
+        return None
+    want = "IPv6" if "v6" in locked else "IPv4"
+    have = "IPv4-only" if fams == {"v4"} else "IPv6-only"
+    detail = f"token is bound to {want} ({ips[0]}) but {host} is {have}"
+    if "v6" in locked and fams == {"v4"}:
+        detail += (" — open the video page with IPv6 disabled so the link binds "
+                   "your IPv4 instead (sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1, "
+                   "copy a fresh link, then re-enable with =0)")
+    return detail
 
 
 def referer_candidates(url: str) -> list[str]:

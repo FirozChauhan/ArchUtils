@@ -246,10 +246,20 @@ def _fetch_single(cfg: dict, args, raw_url: str, dl_url: str, resolved_name: str
     if probe.status in (401, 404, 410):
         raise DownloadError(f"probe HTTP {probe.status} for {dl_url}")
     if probe.status == 403:
-        raise DownloadError(
-            f"probe HTTP 403 for {dl_url} (hotlink/expired token? "
-            f"try --referer https://<embedding-site>/ or --cookies)"
-        )
+        hint = "hotlink/expired token? try --referer https://<embedding-site>/ or --cookies"
+        try:
+            from .util import ip_lock_hint as _lock_hint, token_ips as _token_ips
+            specific = _lock_hint(dl_url)
+            if specific:
+                hint = f"IP-locked link ({specific})"
+            elif _token_ips(dl_url):
+                ips = ", ".join(_token_ips(dl_url))
+                hint = (f"link looks IP-locked (token names {ips}): "
+                        f"it only works from the network where it was created — "
+                        f"open the video page on this machine and copy a fresh link")
+        except Exception:
+            pass
+        raise DownloadError(f"probe HTTP 403 for {dl_url} ({hint})")
     if not referer and probe.referer:
         # probe discovered a working Referer (e.g. site hidden in acctoken);
         # the chunk fetches must send the same one or they get 403.
