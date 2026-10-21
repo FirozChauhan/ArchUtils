@@ -89,7 +89,7 @@ Explicit command-line flags always win over the preset, so `vox --use web --crf 
 - **Batch video conversion** — discovers videos by extension and confirms with ffprobe, then converts the whole selection in one run.
 - **HEVC and AV1** — roughly 50% smaller than H.264 for HEVC; AV1 compresses further for newer players.
 - **Image → AVIF, WebP or JPEG** — PNG, JPG, BMP, TIFF and WebP inputs. AVIF (AV1 still-image) gives the best ratio; WebP needs the `libwebp` encoder, keeps transparency natively and uses libwebp's 0–100 quality; JPEG uses ffmpeg's built-in `mjpeg` encoder and works on every build, quality set with `-q:v` (2–31).
-- **Image resize** — `--resize 50%`, `1920x1080` (fit inside a box, aspect kept), `1920x-`, `x1080`, or a bare `1920` for width only. Shrink-only by default: `min(iw,…)` keeps small sources at their own size, and a trailing `!` is required to upscale. The wizard asks for a size on every image run (Original / 75% / 50% / 25% / custom), and presets can store it.
+- **Image resize** — `--resize 50%`, `1920x1080` (fit inside a box, aspect kept), `1920x-`, `x1080`, or a bare `1920` for width only. Shrink-only by default: `min(iw,…)` keeps small sources at their own size, and a trailing `!` is required to upscale. The wizard puts **format and resize on one screen** (cursor starts on format: `←/→` changes, `↑/↓` switches row, Space toggles resize off/on), and presets can store a size.
 - **One quality dialect** — x265 named presets, SVT-AV1 integers and AOM `cpu-used` values are all normalized to the same two prompts, with per-encoder range validation.
 - **Runtime capability detection** — queries `ffmpeg -encoders` / `-muxers` at startup, prefers SVT-AV1 over the far slower libaom, and only offers what can actually run.
 - **Loss-prevention guards** — skips sources already in the target codec and outputs that already exist, unless `--force`.
@@ -132,7 +132,7 @@ Single file, stdlib only — keep it that way. `parse_resize`, `validate_preset`
 flowchart TD
     P[--use name<br/>~/.config/vox/presets.json] -.-> C
     A[Scan folder<br/>extensions + ffprobe] --> B[Pick files<br/>TUI · args · --all]
-    B --> C[Codec/format · preset · CRF<br/>+ image resize<br/>validated per encoder]
+    B --> C[Codec/format · preset · CRF<br/>image: format + resize<br/>validated per encoder]
     C --> D[Probe source<br/>codec · duration · pix_fmt]
     D --> E{Guard<br/>already target codec? output exists?}
     E -- skip --> B

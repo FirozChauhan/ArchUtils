@@ -1244,18 +1244,13 @@ class Tui:
         if "libwebp" in encoders:
             self.image_format_options.append("webp")
         self.image_format_options.append("jpeg")
-        # Image size step: original, common percentages, or a typed spec.
-        self.size_options = [
-            (None, "keep original size"),
-            ("75%", "75%"),
-            ("50%", "50%"),
-            ("25%", "25%"),
-            ("custom", "custom…"),
-        ]
+        # Image settings screen state: 0 = format row, 1 = resize row.
+        self.settings_row = 0
         try:
             self.resize = parse_resize(args.resize)
         except ValueError:
             self.resize = None
+        self._last_resize = self.resize
         # Only offer modes that are possible AND have files in this folder,
         # so e.g. a folder of only images skips the mode screen entirely.
         self.mode_options = []
@@ -1456,9 +1451,8 @@ class Tui:
         {
             "mode": self._render_mode,
             "files": self._render_files,
-            "size": self._render_size,
+            "image_settings": self._render_image_settings,
             "input": self._render_input,
-            "image_format": self._render_image_format,
             "codec": self._render_codec,
             "preset": self._render_preset,
             "crf": self._render_crf,
@@ -1530,13 +1524,9 @@ class Tui:
             if not self.selected:
                 self._flash("Nothing selected — press Space to pick files, or a to select all.")
             elif self.mode == "image":
-                # Format first (what you get), then size (how big), then quality.
-                if len(self.image_format_options) > 1 and self.args.format is None:
-                    self.screen = "image_format"
-                    self.cursor = self.image_format_options.index(self.image_format)
-                else:
-                    self.screen = "size"
-                    self.cursor = self._size_index()
+                # One screen holds both choices; the cursor starts on format.
+                self.screen = "image_settings"
+                self.settings_row = 0
             else:
                 self.screen = "codec"
                 self.cursor = self.codec_options.index(self.codec)
@@ -1583,54 +1573,96 @@ class Tui:
         elif key in ("q", "esc"):
             self.exit_requested = True
 
-    def _size_index(self) -> int:
-        """Cursor row matching the current resize choice."""
-        for i, (spec, _) in enumerate(self.size_options):
-            if spec == self.resize:
-                return i
-        return len(self.size_options) - 1  # a typed spec lives on 'custom'
+    # -- image settings: format + resize on one screen --------------------- #
 
-    def _advance_from_size(self):
+    def _resize_choices(self) -> list:
+        """Cycle order for the resize row; 'custom' opens the free-text entry."""
+        return [None, "75%", "50%", "25%", "custom"]
+
+    def _resize_index(self) -> int:
+        choices = self._resize_choices()
+        if self.resize in choices:
+            return choices.index(self.resize)
+        return choices.index("custom")
+
+    def _resize_label(self) -> str:
+        if self.resize is None:
+            return "keep original"
+        return self.resize
+
+    def _set_format(self, fmt: str):
+        if fmt == self.image_format:
+            return
+        self.image_format = fmt
+        self.codec = "av1" if fmt == "avif" else fmt
+        self._reset_for_codec()
+
+    def _set_resize(self, spec):
+        self.resize = spec
+        if spec is not None:
+            self._last_resize = spec
+
+    def _change_setting(self, delta: int):
+        if self.settings_row == 0:
+            opts = self.image_format_options
+            if len(opts) > 1:
+                self._set_format(opts[(opts.index(self.image_format) + delta) % len(opts)])
+        else:
+            choices = self._resize_choices()
+            i = max(0, min(len(choices) - 1, self._resize_index() + delta))
+            choice = choices[i]
+            if choice == "custom":
+                if self._resize_index() != choices.index("custom"):
+                    self._open_input()
+            else:
+                self._set_resize(choice)
+
+    def _toggle_resize(self):
+        if self.resize is None:
+            self._set_resize(self._last_resize or "50%")
+        else:
+            self._last_resize = self.resize
+            self.resize = None
+
+    def _advance_from_settings(self):
         if self.codec in ("jpeg", "webp"):
             self.screen = "crf"  # JPEG/WebP have no speed preset
         else:
             self.screen = "preset"
             self.cursor = self.preset_idx
 
-    def _render_size(self):
-        custom = self.resize not in (None, "75%", "50%", "25%")
-        lines = [self._title("Resize images"), ""]
-        for i, (spec, label) in enumerate(self.size_options):
-            on = (spec == self.resize) if spec != "custom" else custom
-            if spec == "custom" and custom:
-                label = f"custom — {self.resize}"
-            text = f" {'•' if on else ' '} {label}"
-            if i == self.cursor:
-                text = self.hl(text, True)
-            lines.append(text)
-        lines.append("")
-        lines.append(" ↑/↓ move · Enter select · Esc back")
+    def _render_image_settings(self):
+        marker = lambda i: "▸" if self.settings_row == i else " "
+        fmt = self.image_format.upper()
+        res = self._resize_label()
+        lines = [self._title("Image settings"), "",
+                 self.hl(f" {marker(0)} Format   ◀ {fmt} ▶", self.settings_row == 0),
+                 self.hl(f" {marker(1)} Resize   ◀ {res} ▶", self.settings_row == 1),
+                 ""]
+        if self.settings_row == 0:
+            lines.append(f" {IMAGE_FORMATS[self.image_format]['desc']}")
+        else:
+            lines.append(" keep original · 75% · 50% · 25% · custom")
+        lines += ["", " ←/→ change · ↑/↓ row · Space toggles resize",
+                  " Enter continue · Esc back"]
         self.paint(lines)
 
-    def _key_size(self, key):
-        if key == "up":
-            self.cursor = max(0, self.cursor - 1)
-        elif key == "down":
-            self.cursor = min(len(self.size_options) - 1, self.cursor + 1)
-        elif key == "enter":
-            spec = self.size_options[self.cursor][0]
-            if spec == "custom":
-                self._open_input()
-                return
-            self.resize = spec
-            self._advance_from_size()
-        elif key == "esc":
-            # back to the format screen when it was shown, else the file list
-            if len(self.image_format_options) > 1 and self.args.format is None:
-                self.screen = "image_format"
-                self.cursor = self.image_format_options.index(self.image_format)
+    def _key_image_settings(self, key):
+        if key in ("up", "down"):
+            self.settings_row = 1 - self.settings_row
+        elif key == "left":
+            self._change_setting(-1)
+        elif key == "right":
+            self._change_setting(+1)
+        elif key == "space":
+            if self.settings_row == 1:
+                self._toggle_resize()
             else:
-                self.screen = "files"
+                self._change_setting(+1)
+        elif key == "enter":
+            self._advance_from_settings()
+        elif key == "esc":
+            self.screen = "files"
 
     def _open_input(self):
         self.input_title = "Custom image size"
@@ -1653,14 +1685,16 @@ class Tui:
     def _key_input(self, key):
         if key == "enter":
             try:
-                self.resize = parse_resize(self.input_buf)
+                spec = parse_resize(self.input_buf)
             except ValueError as e:
                 self.input_error = str(e)
                 return
-            self._advance_from_size()
+            self._set_resize(spec)
+            self.screen = "image_settings"
+            self.settings_row = 1
         elif key == "esc":
-            self.screen = "size"
-            self.cursor = self._size_index()
+            self.screen = "image_settings"
+            self.settings_row = 1
         elif key == "backspace":
             self.input_buf = self.input_buf[:-1]
             self.input_error = ""
@@ -1669,34 +1703,7 @@ class Tui:
             self.input_error = ""
 
     def _image_format_label(self) -> str:
-        return "AVIF or JPEG" if len(self.image_format_options) > 1 else self.image_format.upper()
-
-    def _render_image_format(self):
-        descs = {f: IMAGE_FORMATS[f]["desc"] for f in self.image_format_options}
-        lines = [self._title("Target image format"), ""]
-        for i, f in enumerate(self.image_format_options):
-            mark = "•" if f == self.image_format else " "
-            text = f" {mark} {descs[f]}"
-            if i == self.cursor:
-                text = self.hl(text, True)
-            lines.append(text)
-        lines.append("")
-        lines.append(" ↑/↓ move · Enter select · Esc back")
-        self.paint(lines)
-
-    def _key_image_format(self, key):
-        if key == "up":
-            self.cursor = max(0, self.cursor - 1)
-        elif key == "down":
-            self.cursor = min(len(self.image_format_options) - 1, self.cursor + 1)
-        elif key == "enter":
-            self.image_format = self.image_format_options[self.cursor]
-            self.codec = "av1" if self.image_format == "avif" else self.image_format
-            self._reset_for_codec()
-            self.screen = "size"
-            self.cursor = self._size_index()
-        elif key == "esc":
-            self.screen = "files"
+        return " / ".join(f.upper() for f in self.image_format_options)
 
     def _render_codec(self):
         descs = {
@@ -1772,9 +1779,8 @@ class Tui:
             self.screen = "crf"
         elif key == "esc":
             if self.mode == "image":
-                # format → size → quality, so Esc walks back one step
-                self.screen = "size"
-                self.cursor = self._size_index()
+                self.screen = "image_settings"
+                self.settings_row = 1
             else:
                 self.screen = "codec"
                 self.cursor = self.codec_options.index(self.codec)
@@ -1825,8 +1831,8 @@ class Tui:
             self.screen = "done"
         elif key == "esc":
             if self.mode == "image" and self.codec in ("jpeg", "webp"):
-                self.screen = "size"
-                self.cursor = self._size_index()
+                self.screen = "image_settings"
+                self.settings_row = 1
             else:
                 self.screen = "preset"
                 self.cursor = self.preset_idx
