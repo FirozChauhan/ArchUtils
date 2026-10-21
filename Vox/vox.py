@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Vox — convert videos to HEVC (H.265) or AV1 using ffmpeg.
+Vox — convert videos to HEVC (H.265) or AV1 using ffmpeg, and compress
+images to AVIF, WebP or JPEG (optionally resizing them first).
 
-Run it inside the folder with your videos:
+Run it inside the folder with your videos or images:
 
     python vox.py
 
@@ -115,6 +116,19 @@ JPEG_CRF_MIN, JPEG_CRF_MAX = 2, 31
 WEBP_DEFAULT_CRF = 75
 WEBP_CRF_MIN, WEBP_CRF_MAX = 0, 100
 
+# Image resize. A spec is "50%" (percent), "WxH" (fit inside a box, aspect
+# kept), "Wx-" (width only), "-xH" (height only) or a bare number (= width).
+# A trailing "!" allows upscaling; without it resizing only ever shrinks.
+RESIZE_PERCENT_MIN, RESIZE_PERCENT_MAX = 1, 400
+RESIZE_DIM_MAX = 20000
+RESIZE_CHOICES = [
+    ("1", None, "keep original size"),
+    ("2", "75%", "75%"),
+    ("3", "50%", "50%"),
+    ("4", "25%", "25%"),
+    ("5", "custom", "custom — e.g. 1920x1080 · 1920x- · -x1080 · 50%"),
+]
+
 # pix_fmts that may carry a transparency channel — ffmpeg's AVIF muxer cannot
 # store alpha, so these are flattened onto a white background first.
 MAY_HAVE_ALPHA_PIXFMTS = frozenset({
@@ -127,7 +141,7 @@ AUDIO_BITRATE = "192k"
 
 # Keys allowed in a saved preset. Anything else in .vox.json is ignored with a
 # warning so a hand-edited file can't crash a run.
-PRESET_KEYS = frozenset({"target", "preset", "crf", "copy_audio", "force"})
+PRESET_KEYS = frozenset({"target", "preset", "crf", "copy_audio", "force", "resize"})
 
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -482,6 +496,75 @@ def _legacy_preset_path(cwd: Path) -> Path:
     return cwd / LEGACY_PRESET_FILE_NAME
 
 
+def _sanitize_preset(name: str, settings: dict) -> dict | None:
+    """Validate/coerce one preset's values. None means "skip this preset".
+
+    The file is meant to be hand-editable, so bad values are reported and the
+    preset is skipped (or the bad key dropped) instead of crashing a run later
+    when the value reaches an ffmpeg command line.
+    """
+    target = settings.get("target")
+    if target not in PRESET_TARGETS:
+        print(f"{YELLOW}Warning: preset '{name}' has invalid target "
+              f"'{target}' — skipped.{RESET}")
+        return None
+
+    ranges = {
+        "video-hevc": (X265_CRF_MIN, X265_CRF_MAX),
+        "video-av1": (AV1_CRF_MIN, AV1_CRF_MAX),
+        "image-avif": (AV1_CRF_MIN, AV1_CRF_MAX),
+        "image-webp": (WEBP_CRF_MIN, WEBP_CRF_MAX),
+        "image-jpeg": (JPEG_CRF_MIN, JPEG_CRF_MAX),
+    }
+    lo, hi = ranges[target]
+    crf = settings.get("crf")
+    if isinstance(crf, str) and crf.strip().lstrip("-").isdigit():
+        crf = int(crf.strip())
+    if isinstance(crf, bool) or not isinstance(crf, int) or not (lo <= crf <= hi):
+        print(f"{YELLOW}Warning: preset '{name}' needs an integer crf "
+              f"{lo}-{hi} (got {settings.get('crf')!r}) — skipped.{RESET}")
+        return None
+    settings["crf"] = crf
+
+    preset = settings.get("preset")
+    if target == "video-hevc":
+        if preset not in X265_PRESETS:
+            print(f"{YELLOW}Warning: preset '{name}' needs an x265 preset "
+                  f"({', '.join(X265_PRESETS)}), got {preset!r} — skipped.{RESET}")
+            return None
+    elif target in ("video-av1", "image-avif"):
+        num = str(preset).strip() if preset is not None else ""
+        limit = max(SVT_PRESET_MAX, AOM_PRESET_MAX)
+        if not num.isdigit() or not (0 <= int(num) <= limit):
+            print(f"{YELLOW}Warning: preset '{name}' needs an AV1 preset number "
+                  f"0-{limit}, got {preset!r} — skipped.{RESET}")
+            return None
+        settings["preset"] = num
+    else:  # WebP/JPEG have no speed preset
+        settings.pop("preset", None)
+
+    if target.startswith("image"):
+        if settings.get("resize") is not None:
+            try:
+                norm = parse_resize(str(settings["resize"]))
+            except ValueError as e:
+                print(f"{YELLOW}Warning: preset '{name}': {e} — resize ignored.{RESET}")
+                norm = None
+            if norm:
+                settings["resize"] = norm
+            else:
+                settings.pop("resize", None)
+    else:
+        settings.pop("resize", None)
+
+    for key in ("copy_audio", "force"):
+        if key in settings and not isinstance(settings[key], bool):
+            print(f"{YELLOW}Warning: preset '{name}': '{key}' must be true or "
+                  f"false — ignored.{RESET}")
+            settings.pop(key)
+    return settings
+
+
 def _parse_presets_file(path: Path) -> dict[str, dict]:
     """Read and validate a preset file. Returns {name: settings}."""
     try:
@@ -501,9 +584,8 @@ def _parse_presets_file(path: Path) -> dict[str, dict]:
             print(f"{YELLOW}Warning: preset '{name}' has unknown key(s) "
                   f"{', '.join(sorted(unknown))} — ignored.{RESET}")
         clean = {k: v for k, v in settings.items() if k in PRESET_KEYS}
-        if clean.get("target") not in PRESET_TARGETS:
-            print(f"{YELLOW}Warning: preset '{name}' has invalid target "
-                  f"'{clean.get('target')}' — skipped.{RESET}")
+        clean = _sanitize_preset(name, clean)
+        if clean is None:
             continue
         presets[name] = clean
     return presets
@@ -540,6 +622,8 @@ def preset_label(settings: dict) -> str:
             detail = f"quality={settings.get('crf')}"
         else:
             detail = f"preset={settings.get('preset')}, CRF={settings.get('crf')}"
+    if settings.get("resize"):
+        detail += f", resize={settings['resize']}"
     if settings.get("copy_audio"):
         detail += ", copy-audio"
     if settings.get("force"):
@@ -597,6 +681,11 @@ def build_preset_interactively(cwd: Path, encoders: set[str], name: str | None) 
         print(f"\n{BOLD}JPEG quality{RESET} (2 = best, 31 = worst; lower = better, bigger file).")
         settings["crf"] = ask_int("Quality (-q:v)", JPEG_CRF_MIN, JPEG_CRF_MAX, JPEG_DEFAULT_CRF)
 
+    if target.startswith("image"):
+        resize = prompt_resize(None)
+        if resize:
+            settings["resize"] = resize
+
     if target.startswith("video"):
         ans = ask("Stream-copy audio instead of re-encoding to AAC? [y/N]: ").strip().lower()
         if ans in ("y", "yes"):
@@ -651,6 +740,7 @@ def apply_preset(args: argparse.Namespace, settings: dict, name: str) -> argpars
     if is_image:
         args.images = True
         _set("format", fmt)
+        _set("resize", settings.get("resize"))
     else:
         args.images = False
         _set("codec", codec)
@@ -900,23 +990,138 @@ def convert_one(
 
 
 # --------------------------------------------------------------------------- #
-# Image compression (AVIF)
+# Image compression (AVIF / WebP / JPEG) and resize
 # --------------------------------------------------------------------------- #
+
+def parse_resize(spec: str | None) -> str | None:
+    """Normalise a resize spec. None/''/'none' → None (keep original size).
+
+    Accepted: '50%', '1920x1080', '1920x-', '-x1080', '1920' (= width only),
+    any of them with a trailing '!' to allow upscaling. Raises ValueError on
+    anything else so callers can report instead of handing ffmpeg garbage.
+    """
+    if spec is None:
+        return None
+    s = spec.strip().lower().replace(" ", "")
+    if not s or s in ("none", "off", "0", "orig", "original"):
+        return None
+    up = s.endswith("!")
+    body = s[:-1] if up else s
+    suffix = "!" if up else ""
+
+    if body.endswith("%"):
+        digits = body[:-1]
+        if not digits.isdigit():
+            raise ValueError(f"invalid resize '{spec}': a percent must be a whole number, e.g. 50%")
+        pct = int(digits)
+        if not (RESIZE_PERCENT_MIN <= pct <= RESIZE_PERCENT_MAX):
+            raise ValueError(f"invalid resize '{spec}': percent must be "
+                             f"{RESIZE_PERCENT_MIN}-{RESIZE_PERCENT_MAX}")
+        if pct > 100 and not up:
+            raise ValueError(f"resize '{spec}' would enlarge the image — append '!' to allow that")
+        return f"{pct}%{suffix}"
+
+    if body.isdigit():  # "1920" = max width
+        w, h = body, ""
+    else:
+        w, sep, h = body.partition("x")
+        if not sep:
+            raise ValueError(f"invalid resize '{spec}': use 50%, 1920x1080, 1920x-, -x1080 or 1920")
+    wd = int(w) if w.isdigit() else None
+    hd = int(h) if h.isdigit() else None
+    if (w and wd is None and w != "-") or (h and hd is None and h != "-"):
+        raise ValueError(f"invalid resize '{spec}': use digits (and one 'x' at most)")
+    if wd is None and hd is None:
+        raise ValueError(f"invalid resize '{spec}': needs a width, a height, or both")
+    for n in (wd, hd):
+        if n is not None and not (1 <= n <= RESIZE_DIM_MAX):
+            raise ValueError(f"invalid resize '{spec}': dimensions must be 1-{RESIZE_DIM_MAX}")
+    return f"{wd if wd is not None else '-'}x{hd if hd is not None else '-'}{suffix}"
+
+
+def resize_filter(spec: str | None) -> str | None:
+    """ffmpeg scale filter for a resize spec, or None when not resizing."""
+    norm = parse_resize(spec)
+    if norm is None:
+        return None
+    up = norm.endswith("!")
+    body = norm[:-1] if up else norm
+    if body.endswith("%"):
+        # even width (4:2:0 chroma likes it), height follows the aspect
+        return f"scale=trunc(iw*{int(body[:-1])}/100/2)*2:-2:flags=lanczos"
+    w, _, h = body.partition("x")
+    wd = None if w == "-" else int(w)
+    hd = None if h == "-" else int(h)
+    if wd is not None and hd is not None:
+        if up:
+            return f"scale={wd}:{hd}:force_original_aspect_ratio=decrease:flags=lanczos"
+        # min() keeps small sources at their own size — shrink-only by default
+        return (f"scale='min(iw,{wd})':'min(ih,{hd})':"
+                f"force_original_aspect_ratio=decrease:flags=lanczos")
+    if wd is not None:
+        return f"scale={wd}:-2:flags=lanczos" if up else f"scale='min(iw,{wd})':-2:flags=lanczos"
+    return f"scale=-2:{hd}:flags=lanczos" if up else f"scale=-2:'min(ih,{hd})':flags=lanczos"
+
+
+def prompt_resize(forced: str | None) -> str | None:
+    """Ask how large the output images should be. None means original size."""
+    if forced is not None:
+        try:
+            return parse_resize(forced)
+        except ValueError as e:
+            print(f"{RED}{e}{RESET}")
+            sys.exit(1)
+
+    print(f"\n{BOLD}Resize images?{RESET}")
+    for key, _, desc in RESIZE_CHOICES:
+        print(f"  [{key}] {desc}")
+    preset = {k: v for k, v, _ in RESIZE_CHOICES}
+    while True:
+        choice = ask("Pick one [1]: ").strip().lower() or "1"
+        if choice in preset:
+            spec = preset[choice]
+            if spec != "custom":
+                return parse_resize(spec)
+            while True:
+                raw = ask("Size (e.g. 1920x1080, 1920x-, -x1080, 50%): ").strip()
+                if not raw:
+                    return None
+                try:
+                    return parse_resize(raw)
+                except ValueError as e:
+                    print(f"{RED}{e}{RESET}")
+        try:  # allow typing the spec directly instead of a menu number
+            return parse_resize(choice)
+        except ValueError as e:
+            print(f"{RED}{e}{RESET}")
+
 
 def build_image_command(
     src: Path, out: Path, fmt: str, av1_encoder: str | None,
     preset: str | None, crf: int, pix_fmt: str | None,
+    resize: str | None = None,
 ) -> list[str]:
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
         "-i", str(src),
     ]
+    # Resize first, then flatten — one filtergraph so the scale runs on the
+    # full-resolution source before we composite onto white.
+    vf: list[str] = []
+    scale = resize_filter(resize)
+    if scale:
+        vf.append(scale)
+    if fmt in ("avif", "jpeg") and pix_fmt in MAY_HAVE_ALPHA_PIXFMTS:
+        # AVIF and JPEG can't store alpha — composite onto white instead of
+        # encoding transparent areas as garbage. (WebP keeps alpha natively.)
+        # White is the *background* input: with the transparent image as the
+        # overlay, alpha is honoured; the reverse order drops alpha and paints black.
+        vf.append("split[a][b];[b]drawbox=c=white:t=fill[bg];"
+                  "[bg][a]overlay=shortest=1:format=auto")
+    if vf:
+        cmd += ["-vf", ",".join(vf)]
+
     if fmt == "avif":
-        if pix_fmt in MAY_HAVE_ALPHA_PIXFMTS:
-            # ffmpeg's AVIF muxer can't store alpha — flatten transparency onto white
-            # so transparent areas don't come out as garbage.
-            cmd += ["-vf", "split[a][b];[b]drawbox=c=white:t=fill[bg];"
-                    "[a][bg]overlay=shortest=1:format=auto"]
         cmd += ["-c:v", av1_encoder]
         if av1_encoder == "libsvtav1":
             cmd += ["-preset", preset]
@@ -924,15 +1129,9 @@ def build_image_command(
             cmd += ["-cpu-used", preset, "-row-mt", "1"]
         cmd += ["-crf", str(crf), "-still-picture", "1", "-strict", "-2"]
     elif fmt == "webp":
-        # WebP: libwebp stores alpha natively (yuva420p), so transparency is
-        # kept as-is — no flattening filter needed.
         cmd += ["-c:v", IMAGE_FORMATS["webp"]["encoder"], "-q:v", str(crf)]
         cmd += ["-f", "image2"]
     else:
-        # JPEG: flatten any alpha (JPEG has no alpha channel) and set quality.
-        if pix_fmt in MAY_HAVE_ALPHA_PIXFMTS:
-            cmd += ["-vf", "split[a][b];[b]drawbox=c=white:t=fill[bg];"
-                    "[a][bg]overlay=shortest=1:format=auto"]
         cmd += ["-c:v", IMAGE_FORMATS["jpeg"]["encoder"], "-q:v", str(crf)]
         # image2 needs the extension to pick the format; we pass an explicit path.
         cmd += ["-f", "image2"]
@@ -942,7 +1141,8 @@ def build_image_command(
 
 def convert_image_core(
     src: Path, out_dir: Path, fmt: str, av1_encoder: str | None,
-    preset: str | None, crf: int, force: bool, progress=None, decide=None,
+    preset: str | None, crf: int, resize: str | None = None,
+    force: bool = False, progress=None, decide=None,
 ) -> tuple[str, str]:
     """Shared still-image compression for CLI and TUI.
 
@@ -965,7 +1165,7 @@ def convert_image_core(
     pix_fmt = probe_pix_fmt(src)
     # JPEG flattens alpha onto white; WebP keeps it, so only JPEG "flattens".
     flattened = fmt != "webp" and pix_fmt in MAY_HAVE_ALPHA_PIXFMTS
-    cmd = build_image_command(src, out_path, fmt, av1_encoder, preset, crf, pix_fmt)
+    cmd = build_image_command(src, out_path, fmt, av1_encoder, preset, crf, pix_fmt, resize)
     status, note = run_ffmpeg(cmd, None, src.name, progress)
     if status != "ok":
         try:
@@ -973,16 +1173,19 @@ def convert_image_core(
         except OSError:
             pass
         return status, note
+    extra = []
+    if resize:
+        extra.append(f"resized to {resize}")
     if flattened:
-        note = f"{out_path.name} (transparency flattened to white)"
-    else:
-        note = out_path.name
+        extra.append("transparency flattened to white")
+    note = out_path.name + (f" ({'; '.join(extra)})" if extra else "")
     return "ok", note
 
 
 def convert_one_image(
     src: Path, out_dir: Path, fmt: str, av1_encoder: str | None,
     preset: str | None, crf: int, args: argparse.Namespace,
+    resize: str | None = None,
 ) -> str:
     """CLI variant of convert_image_core with human-readable output."""
     size_mb = src.stat().st_size / (1024 * 1024)
@@ -990,7 +1193,7 @@ def convert_one_image(
 
     decide = (lambda prompt, default: ask(prompt)) if sys.stdin.isatty() else None
     status, note = convert_image_core(
-        src, out_dir, fmt, av1_encoder, preset, crf,
+        src, out_dir, fmt, av1_encoder, preset, crf, resize,
         force=args.force, progress=None, decide=decide,
     )
     if status == "ok":
@@ -1041,6 +1244,18 @@ class Tui:
         if "libwebp" in encoders:
             self.image_format_options.append("webp")
         self.image_format_options.append("jpeg")
+        # Image size step: original, common percentages, or a typed spec.
+        self.size_options = [
+            (None, "keep original size"),
+            ("75%", "75%"),
+            ("50%", "50%"),
+            ("25%", "25%"),
+            ("custom", "custom…"),
+        ]
+        try:
+            self.resize = parse_resize(args.resize)
+        except ValueError:
+            self.resize = None
         # Only offer modes that are possible AND have files in this folder,
         # so e.g. a folder of only images skips the mode screen entirely.
         self.mode_options = []
@@ -1216,6 +1431,8 @@ class Tui:
             return "ctrl_c"
         if c in (0x0D, 0x0A):
             return "enter"
+        if c in (0x7F, 0x08):
+            return "backspace"
         if c == 0x20:
             return "space"
         if 32 <= c <= 126:
@@ -1239,6 +1456,8 @@ class Tui:
         {
             "mode": self._render_mode,
             "files": self._render_files,
+            "size": self._render_size,
+            "input": self._render_input,
             "image_format": self._render_image_format,
             "codec": self._render_codec,
             "preset": self._render_preset,
@@ -1311,16 +1530,10 @@ class Tui:
             if not self.selected:
                 self._flash("Nothing selected — press Space to pick files, or a to select all.")
             elif self.mode == "image":
-                # Pick the target format first when there's a choice the user
-                # hasn't already made explicitly on the command line.
-                if len(self.image_format_options) > 1 and self.args.format is None:
-                    self.screen = "image_format"
-                    self.cursor = self.image_format_options.index(self.image_format)
-                elif self.image_format in ("jpeg", "webp"):
-                    self.screen = "crf"  # JPEG/WebP have no preset step
-                else:
-                    self.screen = "preset"
-                    self.cursor = self.preset_idx
+                # Images always walk through size → format → quality, so the
+                # resize choice is impossible to miss.
+                self.screen = "size"
+                self.cursor = self._size_index()
             else:
                 self.screen = "codec"
                 self.cursor = self.codec_options.index(self.codec)
@@ -1367,6 +1580,91 @@ class Tui:
         elif key in ("q", "esc"):
             self.exit_requested = True
 
+    def _size_index(self) -> int:
+        """Cursor row matching the current resize choice."""
+        for i, (spec, _) in enumerate(self.size_options):
+            if spec == self.resize:
+                return i
+        return len(self.size_options) - 1  # a typed spec lives on 'custom'
+
+    def _advance_from_size(self):
+        if len(self.image_format_options) > 1 and self.args.format is None:
+            self.screen = "image_format"
+            self.cursor = self.image_format_options.index(self.image_format)
+        elif self.codec in ("jpeg", "webp"):
+            self.screen = "crf"
+        else:
+            self.screen = "preset"
+            self.cursor = self.preset_idx
+
+    def _render_size(self):
+        custom = self.resize not in (None, "75%", "50%", "25%")
+        lines = [self._title("Resize images"), ""]
+        for i, (spec, label) in enumerate(self.size_options):
+            on = (spec == self.resize) if spec != "custom" else custom
+            if spec == "custom" and custom:
+                label = f"custom — {self.resize}"
+            text = f" {'•' if on else ' '} {label}"
+            if i == self.cursor:
+                text = self.hl(text, True)
+            lines.append(text)
+        lines.append("")
+        lines.append(" ↑/↓ move · Enter select · Esc back")
+        self.paint(lines)
+
+    def _key_size(self, key):
+        if key == "up":
+            self.cursor = max(0, self.cursor - 1)
+        elif key == "down":
+            self.cursor = min(len(self.size_options) - 1, self.cursor + 1)
+        elif key == "enter":
+            spec = self.size_options[self.cursor][0]
+            if spec == "custom":
+                self._open_input()
+                return
+            self.resize = spec
+            self._advance_from_size()
+        elif key == "esc":
+            self.screen = "files"
+
+    # -- free-text entry (used by the custom size) ------------------------- #
+
+    def _open_input(self):
+        self.input_title = "Custom image size"
+        self.input_hint = "e.g. 1920x1080 · 1920x- · -x1080 · 50% · append ! to upscale"
+        self.input_buf = self.resize if self.resize else ""
+        self.input_error = ""
+        self.screen = "input"
+
+    def _render_input(self):
+        lines = [self._title(self.input_title), "",
+                 f" {BOLD}{self.input_buf}{RESET}_", ""]
+        if self.input_error:
+            lines.append(f" {RED}{self.input_error}{RESET}")
+            lines.append("")
+        lines.append(f" {self.input_hint}")
+        lines.append("")
+        lines.append(" Enter confirm · Backspace delete · Esc cancel")
+        self.paint(lines)
+
+    def _key_input(self, key):
+        if key == "enter":
+            try:
+                self.resize = parse_resize(self.input_buf)
+            except ValueError as e:
+                self.input_error = str(e)
+                return
+            self._advance_from_size()
+        elif key == "esc":
+            self.screen = "size"
+            self.cursor = self._size_index()
+        elif key == "backspace":
+            self.input_buf = self.input_buf[:-1]
+            self.input_error = ""
+        elif len(key) == 1 and key in "0123456789x%-!":
+            self.input_buf += key
+            self.input_error = ""
+
     def _image_format_label(self) -> str:
         return "AVIF or JPEG" if len(self.image_format_options) > 1 else self.image_format.upper()
 
@@ -1398,7 +1696,10 @@ class Tui:
                 self.screen = "preset"
                 self.cursor = self.preset_idx
         elif key == "esc":
-            self.screen = "files"
+            # size → format → quality, so Esc walks back one step
+            self.screen = "size" if self.args.format is None else "files"
+            if self.screen == "size":
+                self.cursor = self._size_index()
 
     def _render_codec(self):
         descs = {
@@ -1478,7 +1779,8 @@ class Tui:
                     self.screen = "image_format"
                     self.cursor = self.image_format_options.index(self.image_format)
                 else:
-                    self.screen = "files"
+                    self.screen = "size"
+                    self.cursor = self._size_index()
             else:
                 self.screen = "codec"
                 self.cursor = self.codec_options.index(self.codec)
@@ -1533,7 +1835,8 @@ class Tui:
                     self.screen = "image_format"
                     self.cursor = self.image_format_options.index(self.image_format)
                 else:
-                    self.screen = "files"
+                    self.screen = "size"
+                    self.cursor = self._size_index()
             else:
                 self.screen = "preset"
                 self.cursor = self.preset_idx
@@ -1566,7 +1869,7 @@ class Tui:
             if self.mode == "image":
                 status, note = convert_image_core(
                     src, out_dir, self.image_format, self.av1_enc, self.preset, self.crf,
-                    force=self.args.force, progress=progress, decide=None,
+                    self.resize, force=self.args.force, progress=progress, decide=None,
                 )
             else:
                 status, note = convert_core(
@@ -1614,6 +1917,8 @@ class Tui:
             settings = f"quality {self.crf}"
         else:
             settings = f"preset {self.preset} · CRF {self.crf}"
+        if self.mode == "image" and self.resize:
+            settings += f" · resize {self.resize}"
         lines = [self._title("Converting")]
         lines.append(f" {len(self.jobs)} file(s) → {codec_label} · {settings}")
         lines.append(f" Output: {self.cwd / OUTPUT_DIR_NAME}")
@@ -1681,6 +1986,7 @@ def parse_args() -> argparse.Namespace:
             "  python vox.py movie.mkv --codec av1 --preset 8 --crf 30\n"
             "  python vox.py --images                   interactive TUI, compress images (AVIF, WebP or JPEG)\n"
             "  python vox.py --all --images --format webp --crf 80  every image → WebP, no TUI\n"
+            "  python vox.py --all --images --resize 1920x-     every image → fit inside 1920 wide\n"
             "  python vox.py --all --images --format jpeg --crf 3   every image → JPEG, no TUI\n"
             "  python vox.py mk web                     create a global preset named 'web'\n"
             "  python vox.py --use web                  convert the whole folder with preset 'web'\n"
@@ -1697,8 +2003,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--preset", help="quality preset: x265 name (e.g. medium, slow) or AV1 number (0-13)")
     p.add_argument("--crf", type=int, help="quality: lower = better, bigger file (defaults: HEVC 24, AV1/AVIF 30)")
     p.add_argument("--all", action="store_true", help="convert every video in the folder without asking")
-    p.add_argument("--images", action="store_true", help="compress images (AVIF or JPEG) instead of converting videos")
+    p.add_argument("--images", action="store_true", help="compress images (AVIF, WebP or JPEG) instead of converting videos")
     p.add_argument("--format", choices=["avif", "webp", "jpeg"], help="image output format (default: ask; AVIF if available)")
+    p.add_argument("--resize", metavar="SPEC",
+                   help="resize images first: 50%%, 1920x1080, 1920x-, 1920, or x1080 "
+                        "for height only (write --resize=-x1080 if you prefer the dashes); "
+                        "append ! to allow upscaling (default: ask / original)")
     p.add_argument("--force", action="store_true", help="overwrite files that already exist in Vox Output")
     p.add_argument("--copy-audio", action="store_true", help="copy the original audio stream instead of re-encoding to AAC")
     args = p.parse_args()
@@ -1812,6 +2122,13 @@ def main() -> int:
     if not image_mode and not videos and images:
         image_mode = True
 
+    if args.resize is not None:
+        try:
+            args.resize = parse_resize(args.resize)
+        except ValueError as e:
+            print(f"{RED}{e}{RESET}")
+            return 1
+
     if image_mode:
         if not images:
             print(f"{YELLOW}No image files found in {cwd}{RESET}")
@@ -1836,6 +2153,10 @@ def main() -> int:
         and sys.stdin.isatty()
         and getattr(sys.stdout, "isatty", lambda: False)()
     )
+    if not image_mode and args.resize is not None and not use_tui:
+        # Keep it for the TUI's image mode; a plain video run has no use for it.
+        print(f"{YELLOW}--resize only applies to images — ignoring it.{RESET}")
+        args.resize = None
     if use_tui:
         # JPEG is always possible (built-in mjpeg); AVIF only with an AV1 encoder + muxer.
         if image_mode and not (av1_enc and avif_ok) and not jpeg_ok:
@@ -1850,6 +2171,7 @@ def main() -> int:
 
     if image_mode:
         fmt, av1_encoder, preset, crf = resolve_image_settings(args, encoders)
+        resize = prompt_resize(args.resize)
         selected = select_files(args, images, cwd, "image")
 
         out_dir = cwd / OUTPUT_DIR_NAME
@@ -1861,12 +2183,14 @@ def main() -> int:
             plan = f"WebP (libwebp), quality={crf}"
         else:
             plan = f"JPEG (mjpeg), quality={crf}"
+        if resize:
+            plan += f", resize={resize}"
         print(f"\n{BOLD}Plan:{RESET} {len(selected)} image(s) → {plan}")
         print(f"Output folder: {out_dir}  (files keep their original names, {ext} extension)\n")
 
         converted, already, exists, failed = 0, 0, 0, []
         for path in selected:
-            status = convert_one_image(path, out_dir, fmt, av1_encoder, preset, crf, args)
+            status = convert_one_image(path, out_dir, fmt, av1_encoder, preset, crf, args, resize)
             if status == "ok":
                 converted += 1
             elif status == "failed":
