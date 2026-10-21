@@ -1246,6 +1246,7 @@ class Tui:
         self.image_format_options.append("jpeg")
         # Image settings screen state: 0 = format row, 1 = resize row.
         self.settings_row = 0
+        self.per_format: dict[str, dict] = {}  # codec → {crf, preset}
         try:
             self.resize = parse_resize(args.resize)
         except ValueError:
@@ -1591,11 +1592,29 @@ class Tui:
         return self.resize
 
     def _set_format(self, fmt: str):
+        """Change the output format. Only format-specific settings move.
+
+        Resize and the file selection are untouched: they describe the input,
+        not the container. Quality/preset are remembered per format, so
+        flipping AVIF → WebP → AVIF restores the AVIF value you had set instead
+        of resetting it to a default.
+        """
         if fmt == self.image_format:
             return
+        self._remember_format_settings()
         self.image_format = fmt
         self.codec = "av1" if fmt == "avif" else fmt
         self._reset_for_codec()
+        saved = self.per_format.get(self.codec)
+        if saved:
+            if self.preset_list and saved.get("preset") in self.preset_list:
+                self.preset = saved["preset"]
+                self.preset_idx = self.preset_list.index(self.preset)
+            if isinstance(saved.get("crf"), int):
+                self.crf = max(self.crf_lo, min(self.crf_hi, saved["crf"]))
+
+    def _remember_format_settings(self):
+        self.per_format[self.codec] = {"crf": self.crf, "preset": self.preset}
 
     def _set_resize(self, spec):
         self.resize = spec
@@ -1655,10 +1674,9 @@ class Tui:
         elif key == "right":
             self._change_setting(+1)
         elif key == "space":
+            # Space only toggles the resize row — it must never change format.
             if self.settings_row == 1:
                 self._toggle_resize()
-            else:
-                self._change_setting(+1)
         elif key == "enter":
             self._advance_from_settings()
         elif key == "esc":
