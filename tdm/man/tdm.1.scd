@@ -25,6 +25,27 @@ tdm - download files with browser impersonation, resume and segmentation
 *--min-split-size* _SIZE_
 	Minimum chunk size, e.g. 1M (default 1M).
 
+*--max-items* _N_
+	Cap posts for a whole-profile pull (0 = all).
+
+*--no-browser*
+	Skip the browser and use Instagram's HTTP profile API. That path is gated
+	(429 or an app shell) for most sessions; it stays available for machines
+	without chromium and for debugging.
+
+*--headed*
+	Show the chromium window. Useful for the first run (log in once — the
+	session is kept in _~/.local/share/tdm/browser_) and for debugging.
+
+*--page-delay* _S_
+	Seconds to wait between profile feed pages on the HTTP path
+	(default 1.0). The browser path pages by scrolling instead.
+
+*--skip-existing*, *--no-skip-existing*
+	Keep files already on disk with a matching size. On by default for
+	whole-profile pulls, off for single URLs. *--no-skip-existing* forces a
+	re-download.
+
 *--limit-rate* _SIZE_
 	Global cap, e.g. 500K, 4.2M.
 
@@ -56,6 +77,14 @@ tdm - download files with browser impersonation, resume and segmentation
 # FILES
 
 _~/.config/tdm/config.toml_, _~/.local/state/tdm/tdm.log_, _*.part_ + _*.part.json_ next to dest.
+
+A whole-profile pull writes into _DEST/@username/_. It opens
+_instagram.com/username/_ in headless chromium, injects the stored cookies,
+scrolls the grid to the end and downloads each post it finds with the normal
+resolver, so carousels expand to several files. Re-running skips files already
+on disk. If the browser shows a login wall, run once with *--headed* and log in;
+the session persists in _~/.local/share/tdm/browser/_. The HTTP path
+(*--no-browser*) keeps its paging cursor in _DEST/@username/.tdm-profile.json_.
 
 # EXAMPLES
 

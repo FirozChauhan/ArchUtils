@@ -21,6 +21,7 @@ DEFAULTS: dict = {
         "retry_delay": 1.0,
         "max_connections": 8,
         "min_split_size": "1M",
+        "page_delay": 1.0,
         "limit_rate": "",
         "proxy": "",
     },
@@ -160,6 +161,7 @@ retries = 5
 retry_delay = 1.0
 max_connections = 8
 min_split_size = "1M"
+#page_delay = 1.0          # seconds between Instagram profile feed pages
 #limit_rate = "0"         # e.g. 500K, 4.2M, 0 = unlimited
 #proxy = "socks5://127.0.0.1:1080"
 

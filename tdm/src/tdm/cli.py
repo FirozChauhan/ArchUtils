@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -151,7 +152,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("-x", "--max-connections", type=int, default=None, help="max connections (default 8)")
     p.add_argument("--min-split-size", default=None, help="min chunk size e.g. 1M (default 1M)")
     p.add_argument("--limit-rate", default=None, help="global speed cap e.g. 500K, 4.2M")
-    p.add_argument("--max-items", type=int, default=0, help="max files for Instagram Saved (0 = all)")
+    p.add_argument("--max-items", type=int, default=0, help="max posts for Instagram profile / Saved (0 = all)")
+    p.add_argument("--page-delay", type=float, default=None, help="seconds between profile feed pages (default 1.0)")
+    p.add_argument("--skip-existing", dest="skip_existing", action="store_true", default=None,
+                   help="keep files already downloaded with a matching size (default: on for profiles)")
+    p.add_argument("--no-skip-existing", dest="skip_existing", action="store_false",
+                   help="re-download files that already exist")
+    p.add_argument("--no-browser", action="store_true",
+                   help="use the HTTP profile API instead of driving chromium (usually 429s)")
+    p.add_argument("--headed", action="store_true",
+                   help="show the chromium window (log in once, or to debug)")
     p.add_argument("--parallel", type=int, default=3, help="parallel file downloads for multi-file posts (default 3)")
     p.add_argument("--no-translate", action="store_true", help="keep original language in X filenames")
     p.add_argument("-y", "--yes", "--no-prompt", dest="no_prompt", action="store_true",
@@ -316,6 +326,9 @@ def _fetch_single(cfg: dict, args, raw_url: str, dl_url: str, resolved_name: str
     list_name = getattr(args, "list_name", "")
     if list_name:
         base_dir = base_dir / sanitize_list_name(list_name)
+    profile_dir = getattr(args, "profile_dir", "")
+    if profile_dir:  # whole-profile runs pick the per-user directory
+        base_dir = Path(profile_dir).expanduser()
     if dest_dir and str(dest_dir) not in (".", ""):
         final = dest_dir.expanduser() / fname
     elif args.output and len(Path(args.output).expanduser().parts) > 1:
@@ -352,6 +365,15 @@ def _fetch_single(cfg: dict, args, raw_url: str, dl_url: str, resolved_name: str
     }
     if getattr(args, "list_name", ""):
         plan["list"] = args.list_name
+
+    # Re-runs (and long profile pulls) should not re-fetch what is already on
+    # disk. A size match against the probe proves the file is complete; an
+    # unknown remote size means the name alone is good enough.
+    if getattr(args, "skip_existing", None) and not args.no_resume and final.exists():
+        have = final.stat().st_size
+        if probe.total <= 0 or have == probe.total:
+            plan.update({"done": str(final), "bytes": have, "skipped": True})
+            return plan
 
     if args.dry_run:
         return plan
@@ -441,8 +463,14 @@ def one(cfg: dict, args, raw_url: str) -> dict:
         r = items[0]
         return _fetch_single(cfg, args, raw_url, r.url, r.filename, r.headers, r.page_url,
                              prefer_resolved=prefer)
-    # carousel / album / saved library: N files at a time, never prompt per file.
-    # Bars would garble across threads, so workers use plain progress.
+    return _fetch_many(cfg, args, raw_url, items, prefer)
+
+
+def _fetch_many(cfg: dict, args, raw_url: str, items: list, prefer: bool) -> dict:
+    """Download N resolved files N-at-a-time, never prompting per file.
+
+    Bars would garble across threads, so workers use plain progress.
+    """
     import copy as _copy
     from concurrent.futures import ThreadPoolExecutor as _Pool
 
@@ -473,10 +501,251 @@ def one(cfg: dict, args, raw_url: str) -> dict:
     first = dict(plans[0])
     first["files"] = [p.get("done") or p.get("file") for p in plans]
     first["count"] = len(plans)
+    first["skipped"] = sum(1 for p in plans if p.get("skipped"))
     if failed:
         first["failed_count"] = len(failed)
         first["failed"] = [p.get("file") for p in failed]
     return first
+
+
+def _profile_state_path(user_dir: Path) -> Path:
+    return user_dir / ".tdm-profile.json"
+
+
+def _profile_via_browser(cfg: dict, args, raw_url: str, username: str) -> dict:
+    """Enumerate the grid in a real browser, then download each post normally.
+
+    Instagram serves profile listings only to a trusted client, so the browser
+    (with the stored cookie jar injected) collects the post URLs and the
+    existing per-post resolver does the rest.
+    """
+    from . import browser as _browser
+
+    net = cfg["network"]
+    cookies = args.cookies or net.get("cookies", "")
+    user_dir = _base_dest(cfg, args) / f"@{username}"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    args.profile_dir = str(user_dir)
+    if args.skip_existing is None:
+        args.skip_existing = True
+    limit = getattr(args, "max_items", 0) or 0
+
+    if not args.quiet and not args.json:
+        print(f"opening instagram.com/{username}/ in chromium …", file=sys.stderr)
+    try:
+        urls = _browser.collect_profile_posts(
+            username, cookies=cookies, limit=limit,
+            headed=getattr(args, "headed", False),
+            log=None if args.quiet else (lambda n: print(f"  grid: {n} posts",
+                                                         file=sys.stderr)),
+        )
+    except _browser.BrowserError as e:
+        raise DownloadError(str(e)) from e
+
+    plan: dict = {
+        "url": raw_url, "profile": f"@{username}", "dir": str(user_dir),
+        "done": str(user_dir), "files": [], "count": 0, "skipped": 0,
+        "posts_total": len(urls), "mode": "browser",
+    }
+    if args.dry_run:
+        plan["posts"] = urls
+        return plan
+
+    failed: list[str] = []
+    for i, post_url in enumerate(urls, 1):
+        if not args.quiet and not args.json:
+            print(f"  [{i}/{len(urls)}] {post_url.rstrip('/').rsplit('/', 1)[-1]}",
+                  file=sys.stderr)
+        try:
+            got = one(cfg, args, post_url)
+        except Exception as e:
+            if "cancelled" in str(e).lower():
+                raise
+            LOG.error("%s: %s", post_url, e)
+            failed.append(post_url)
+            continue
+        if got.get("skipped"):
+            plan["skipped"] += 1
+        else:
+            plan["count"] += got.get("count", 0) or 1
+        plan["files"].extend(got.get("files") or [])
+        if got.get("failed"):
+            failed.extend(str(f) for f in got["failed"])
+
+    if failed:
+        plan["failed_count"] = len(failed)
+        plan["failed"] = failed
+        plan["partial"] = True
+    if not args.quiet and not args.json:
+        print(f"{plan['profile']}: {plan['count']} files saved, {plan['skipped']} already "
+              f"present, {len(failed)} failed of {len(urls)} posts -> {user_dir}",
+              file=sys.stderr)
+    return plan
+
+
+def one_profile(cfg: dict, args, raw_url: str) -> dict:
+    """Download every post of a profile, one feed page at a time.
+
+    Page-by-page (not resolve-all-then-download) keeps a 2000-post pull from
+    holding everything in memory, and lets the cursor hit disk after each page
+    so Ctrl-C / a 429 stall resumes where it stopped.
+    """
+    from .instagram import iter_profile_media, profile_info, profile_username_from_url
+
+    net = cfg["network"]
+    impersonate = args.impersonate if args.impersonate is not None else net.get("impersonate", "chrome")
+    cookies = args.cookies or net.get("cookies", "")
+    proxy = args.proxy or net.get("proxy", "")
+    timeout = args.timeout or net.get("timeout", 30)
+    delay = args.page_delay if args.page_delay is not None else net.get("page_delay", 1.0)
+
+    username = profile_username_from_url(raw_url)
+    if not username:
+        raise DownloadError(f"can't read a username from {raw_url}")
+    if args.output:
+        raise DownloadError("-o/--output can't be used for a whole profile; use -d/--dest")
+
+    # A real browser is the reliable path: Instagram answers 429 / the web-app
+    # shell to plain HTTP clients, the same cookies render the grid fine.
+    if not getattr(args, "no_browser", False):
+        from . import browser as _browser
+
+        if _browser.is_available():
+            return _profile_via_browser(cfg, args, raw_url, username)
+        LOG.warning("no chromium/chrome found — falling back to the HTTP profile API")
+
+    if not cookies:
+        raise DownloadError(
+            "profile downloads need a logged-in session — run `tdm cookies <cookies.txt>` "
+            "(export it while logged in) or pass --cookies"
+        )
+
+    sess = make_session(impersonate, args.user_agent or net.get("user_agent", ""),
+                        cookies, proxy, timeout)
+    info = profile_info(username, sess=sess, timeout=timeout)
+    if info["private"]:
+        raise DownloadError(
+            f"@{info['username']} is private — follow it with the account in your cookies, then retry"
+        )
+
+    user_dir = _base_dest(cfg, args) / f"@{info['username']}"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    state_path = _profile_state_path(user_dir)
+    cursor = ""
+    if not args.no_resume:
+        try:
+            st = json.loads(state_path.read_text())
+            if st.get("user_id") == info["id"] and isinstance(st.get("next_max_id"), str):
+                cursor = st["next_max_id"]
+        except Exception:
+            cursor = ""
+
+    if args.skip_existing is None:
+        args.skip_existing = True  # profile pulls are long; never redo finished files
+    args.profile_dir = str(user_dir)
+    limit = getattr(args, "max_items", 0) or 0
+
+    plan: dict = {
+        "url": raw_url, "profile": f"@{info['username']}", "user_id": info["id"],
+        "posts_total": info["count"], "dir": str(user_dir), "done": str(user_dir),
+        "files": [], "count": 0, "skipped": 0, "posts_seen": 0,
+    }
+    if cursor:
+        plan["resumed_from"] = cursor
+
+    if args.dry_run:
+        first = next(iter_profile_media(info["username"], info["id"], sess=sess,
+                                        timeout=timeout, limit=limit, delay=0,
+                                        start_cursor=cursor,
+                                        first_page=[] if cursor else info["first_page"],
+                                        first_cursor="" if cursor else info["end_cursor"],
+                                        first_count=info["first_count"]), None)
+        if first:
+            plan["posts_seen"] = first.posts
+            plan["next_cursor"] = first.cursor
+            plan["first_page"] = [m.filename for m in first.items]
+        return plan
+
+    failed: list[str] = []
+    finished = False
+    pages = 0
+    partial_note = ""
+    # Resuming means "continue after the cursor we already reached", so page 1
+    # (the inline payload) is skipped then; otherwise it costs no request.
+    first_page = [] if cursor else info["first_page"]
+    first_cursor = "" if cursor else info["end_cursor"]
+    try:
+        for page in iter_profile_media(info["username"], info["id"], sess=sess,
+                                       timeout=timeout, limit=limit, delay=delay,
+                                       start_cursor=cursor, first_page=first_page,
+                                       first_cursor=first_cursor,
+                                       first_count=info["first_count"]):
+            pages += 1
+            plan["posts_seen"] += page.posts
+            if page.items:
+                try:
+                    got = _fetch_many(cfg, args, raw_url, page.items, True)
+                except Exception as e:
+                    if "cancelled" in str(e).lower():
+                        raise
+                    LOG.error("page %d: %s", pages, e)
+                    failed.append(str(e))
+                    got = {}
+                plan["count"] += got.get("count", 0)
+                plan["skipped"] += got.get("skipped", 0)
+                plan["files"].extend(got.get("files") or [])
+                if got.get("failed"):
+                    failed.extend(str(f) for f in got["failed"])
+            if page.cursor:
+                state_path.write_text(json.dumps({
+                    "username": info["username"], "user_id": info["id"],
+                    "next_max_id": page.cursor, "posts_seen": plan["posts_seen"],
+                    "ts": time.time(),
+                }, indent=1))
+            if not args.quiet and not args.json:
+                print(f"  page {pages}: {page.posts} posts, {len(page.items)} files "
+                      f"(seen {plan['posts_seen']}/{info['count'] or '?'})", file=sys.stderr)
+            if not page.more:
+                finished = True
+                break
+    except RuntimeError as e:
+        # Page 1 already landed; say exactly why paging stopped instead of
+        # throwing away a useful partial pull.
+        partial_note = str(e)
+        LOG.warning("stopped paging: %s", e)
+
+    if finished:
+        state_path.unlink(missing_ok=True)
+    elif partial_note:
+        plan["partial"] = True
+        plan["paging_error"] = partial_note
+        if not args.quiet and not args.json:
+            print(f"  ! partial pull: {partial_note}", file=sys.stderr)
+    if failed:
+        plan["failed_count"] = len(failed)
+        plan["failed"] = failed
+    if not args.quiet and not args.json:
+        print(f"{plan['profile']}: {plan['count']} files saved, {plan['skipped']} already present, "
+              f"{plan['posts_seen']}/{info['count'] or '?'} posts seen -> {user_dir}", file=sys.stderr)
+    if not plan["count"] and not plan["skipped"] and not failed:
+        raise DownloadError(f"@{info['username']}: feed returned no media")
+    return plan
+
+
+def _base_dest(cfg: dict, args) -> Path:
+    raw_dest = args.dest or cfg["general"].get("dest", "")
+    if raw_dest and raw_dest not in ("~/Downloads", "$HOME/Downloads"):
+        return Path(raw_dest).expanduser()
+    return default_dest()
+
+
+def _is_profile(url: str) -> bool:
+    try:
+        from .instagram import is_profile_url
+
+        return is_profile_url(url)
+    except Exception:
+        return False
 
 
 def main(argv=None) -> int:
@@ -553,7 +822,8 @@ def main(argv=None) -> int:
     results, failed = [], 0
     for u in args.urls:
         try:
-            plan = one(cfg, args, u)
+            plan = one_profile(cfg, args, u) if _is_profile(u) and not args.no_extract \
+                else one(cfg, args, u)
             results.append(plan)
             if not use_json and not args.quiet and not args.dry_run:
                 print(f"saved: {plan.get('done')}", file=sys.stderr)
@@ -565,12 +835,13 @@ def main(argv=None) -> int:
             LOG.error("%s: %s", u, e)
             if do_notify:
                 notify("tdm failed", f"{u}: {e}")
+    partial = any(isinstance(r, dict) and r.get("partial") for r in results)
     if use_json:
         print(json.dumps(results, indent=2))
     elif args.dry_run and not args.quiet:
         for r in results:
             print(json.dumps(r, indent=2))
-    return 1 if failed else 0
+    return 1 if failed or partial else 0
 
 
 if __name__ == "__main__":

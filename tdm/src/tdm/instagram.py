@@ -11,8 +11,11 @@ import html as _html
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass
 from urllib.parse import urlparse
+
+from .util import parse_retry_after
 
 LOG = logging.getLogger("tdm")
 
@@ -27,6 +30,16 @@ IG_SHARE_RE = re.compile(r"https?://(?:www\.)?instagr\.am/(?:p|reel)/(?P<id>[^/?
 SAVED_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/(?P<user>[^/?#]+)/saved(?:/all-posts)?/?(?:[?#]|$)"
 )
+PROFILE_RE = re.compile(
+    r"https?://(?:www\.)?instagram\.com/(?P<user>[A-Za-z0-9._]{1,30})/?(?:[?#]|$)"
+)
+# Site routes that sit in the username position but are not profiles.
+RESERVED_PATHS = frozenset({
+    "p", "tv", "reel", "reels", "saved", "explore", "accounts", "stories",
+    "direct", "about", "developer", "developers", "legal", "emails", "challenge",
+    "web", "api", "oauth", "privacy", "terms", "help", "invites", "download",
+    "directory", "session", "your_activity", "graphql", "static", "push",
+})
 LSD_RE = re.compile(r'\["LSD",\[\],\{"token":"([^"]+)"')
 
 _ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -38,6 +51,21 @@ def is_instagram_url(url: str) -> bool:
 
 def is_saved_url(url: str) -> bool:
     return bool(SAVED_RE.search(url))
+
+
+def profile_username_from_url(url: str) -> str | None:
+    """Bare profile URL -> username; None for posts/reels/saved/site routes."""
+    m = PROFILE_RE.match((url or "").strip())
+    if not m:
+        return None
+    user = m.group("user")
+    if user.lower() in RESERVED_PATHS or user.startswith(("_", ".")):
+        return None
+    return user
+
+
+def is_profile_url(url: str) -> bool:
+    return profile_username_from_url(url) is not None
 
 
 def shortcode_from_url(url: str) -> str | None:
@@ -481,3 +509,204 @@ def resolve_saved_media(impersonate: str = "chrome", cookies: str = "",
         if limit and len(out) >= limit:
             return out[:limit]
     return out
+
+
+# --- whole-profile download -------------------------------------------------
+# A profile page is paged by cursor: web_profile_info gives the numeric pk,
+# then api/v1/feed/user/<pk>/?count=33&max_id=... returns the same v1 media
+# objects the /saved/ feed does, newest first. Both need a logged-in session
+# (Instagram answers 401 login_required to anonymous callers here).
+
+@dataclass
+class ProfilePage:
+    items: list[IGMedia]
+    cursor: str  # next_max_id, "" when the feed is exhausted
+    posts: int  # posts on this page (files can be more: carousels)
+    more: bool
+
+
+def _bootstrap(sess, timeout: int = 30) -> tuple[str, str]:
+    """Fetch the site root for an LSD token + csrftoken cookie."""
+    lsd = csrf = ""
+    try:
+        r = sess.get("https://www.instagram.com/", timeout=timeout)
+        m = LSD_RE.search(getattr(r, "text", "") or "")
+        lsd = m.group(1) if m else ""
+        try:
+            csrf = sess.cookies.get("csrftoken") or ""
+        except Exception:
+            csrf = ""
+    except Exception as e:
+        LOG.debug("ig bootstrap failed: %s", e)
+    return lsd, csrf
+
+
+def _json_get(sess, url: str, headers: dict, params: dict | None = None,
+              timeout: int = 30, label: str = "request", attempts: int = 3) -> dict:
+    """GET JSON, pacing out 429s via Retry-After; clear errors for auth walls."""
+    for attempt in range(attempts):
+        r = sess.get(url, headers=headers, params=params, timeout=timeout)
+        status = getattr(r, "status_code", 0)
+        if status == 429:
+            wait = parse_retry_after(getattr(r, "headers", {}).get("retry-after"),
+                                     5.0 * (2 ** attempt))
+            wait = min(max(wait, 1.0), 300.0)
+            LOG.warning("instagram rate limit on %s, waiting %.0fs", label, wait)
+            time.sleep(wait)
+            continue
+        if status in (401, 403):
+            raise RuntimeError(
+                f"{label}: HTTP {status} — Instagram wants a logged-in session. "
+                "Run `tdm cookies <cookies.txt>` (export it while logged in), then retry."
+            )
+        if status == 404:
+            raise RuntimeError(f"{label}: HTTP 404 — nothing there (check the username)")
+        if status != 200:
+            raise RuntimeError(f"{label}: HTTP {status}")
+        ctype = str(getattr(r, "headers", {}).get("content-type", "")).lower()
+        if ctype.startswith("text/html"):
+            raise RuntimeError(
+                f"{label}: Instagram answered with the web-app HTML shell instead of JSON — "
+                "this endpoint (cursor paging) is not served to cookie/web sessions."
+            )
+        try:
+            return r.json()
+        except Exception as e:
+            raise RuntimeError(f"{label}: response was not JSON ({e})") from e
+    raise RuntimeError(
+        f"{label}: Instagram refused this lookup with HTTP 429 after {attempts} tries.\n"
+        "Profile LISTING is gated separately from single posts: /api/v1/users/* and the\n"
+        "web GraphQL endpoint answer 429 or an app shell, while /api/v1/media/<pk>/info/\n"
+        "(what tdm uses for one post) and /api/v1/feed/saved/posts/ keep working. So this\n"
+        "is not a broken cookies file. Check whether the profile grid loads in a normal\n"
+        "browser on this connection: if it does, retry with fresh cookies; if it does not,\n"
+        "Instagram is gating this network and profile pulls cannot work from here."
+    )
+
+
+def profile_info(username: str, sess=None, impersonate: str = "chrome", cookies: str = "",
+                 proxy: str = "", timeout: int = 30) -> dict:
+    """Resolve @username -> {id, username, count, private}. Raises RuntimeError."""
+    if not username:
+        raise RuntimeError("empty username")
+    if sess is None:
+        from .probe import make_session
+
+        sess = make_session(impersonate or "chrome", "", cookies, proxy, timeout)
+    lsd, csrf = _bootstrap(sess, timeout)
+    headers = _api_headers(lsd, csrf)
+    headers.update({
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://www.instagram.com/{username}/",
+    })
+    data = _json_get(sess, "https://www.instagram.com/api/v1/users/web_profile_info/",
+                     headers=headers, params={"username": username}, timeout=timeout,
+                     label=f"@{username}", attempts=2)
+    user = ((data.get("data") or {}).get("user") or {}) if isinstance(data, dict) else {}
+    if not isinstance(user, dict) or not user:
+        raise RuntimeError(f"@{username}: no such profile")
+    uid = str(user.get("id") or "")
+    if not uid:
+        raise RuntimeError(f"@{username}: Instagram returned no user id")
+    count = 0
+    edge = user.get("edge_owner_to_timeline_media")
+    if isinstance(edge, dict):
+        try:
+            count = int(edge.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+    # web_profile_info ships the newest 12 posts inline; that is page 1 and the
+    # only page some networks are allowed to see (cursor paging is app-only).
+    edges = (edge or {}).get("edges") if isinstance(edge, dict) else None
+    first_page = _items_from_edges(edges if isinstance(edges, list) else [],
+                                  str(user.get("username") or username))
+    pinfo = ((edge or {}).get("page_info") or {}) if isinstance(edge, dict) else {}
+    return {"id": uid, "username": str(user.get("username") or username),
+            "count": count, "private": bool(user.get("is_private")),
+            "first_page": first_page, "first_count": len(edges) if isinstance(edges, list) else 0,
+            "end_cursor": str(pinfo.get("end_cursor") or ""),
+            "has_next": bool(pinfo.get("has_next_page"))}
+
+
+def _items_from_edges(edges: list, username: str) -> list[IGMedia]:
+    """Legacy GraphQL edges ([{node: {...}}]) -> IGMedia, reusing the v1 parser."""
+    out: list[IGMedia] = []
+    for e in edges:
+        node = e.get("node") if isinstance(e, dict) else None
+        if not isinstance(node, dict):
+            continue
+        code = str(node.get("shortcode") or node.get("code") or "")
+        out.extend(items_from_product_info(node, code or "post", username))
+    return out
+
+
+def iter_profile_media(username: str, user_id: str, sess=None, impersonate: str = "chrome",
+                       cookies: str = "", proxy: str = "", timeout: int = 30,
+                       limit: int = 0, delay: float = 1.0, start_cursor: str = "",
+                       page_size: int = 33, first_page: list[IGMedia] | None = None,
+                       first_cursor: str = "", first_count: int = 0):
+    """Yield one ProfilePage per feed page, newest first.
+
+    ``first_page``/``first_cursor`` let the caller hand over the page that
+    web_profile_info already returned, so page 1 costs no extra request.
+    ``limit`` caps posts (not files). Pinned posts repeating across pages are
+    de-duplicated.
+    """
+    seen_codes: set[str] = set()
+    posts = 0
+    if first_page:
+        posts = first_count or len(first_page)
+        yield ProfilePage(items=first_page, cursor=first_cursor, posts=posts,
+                          more=bool(first_cursor))
+        if not first_cursor:
+            return
+        if limit and posts >= limit:
+            return
+        if delay and delay > 0:
+            time.sleep(delay)
+    if sess is None:
+        from .probe import make_session
+
+        sess = make_session(impersonate or "chrome", "", cookies, proxy, timeout)
+    lsd, csrf = _bootstrap(sess, timeout)
+    headers = _api_headers(lsd, csrf)
+    headers.update({
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://www.instagram.com/{username}/",
+    })
+    url = f"https://www.instagram.com/api/v1/feed/user/{user_id}/"
+    cursor = start_cursor or first_cursor or ""
+    seen_cursors: set[str] = set()
+    while True:
+        params: dict = {"count": page_size}
+        if cursor:
+            params["max_id"] = cursor
+        data = _json_get(sess, url, headers=headers, params=params, timeout=timeout,
+                         label=f"@{username} feed")
+        raw = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(raw, list):
+            raise RuntimeError(f"@{username}: unexpected feed payload (no items list)")
+        items: list[IGMedia] = []
+        for media in raw:
+            if not isinstance(media, dict):
+                continue
+            code = str(media.get("code") or media.get("shortcode") or "")
+            if code and code in seen_codes:
+                continue
+            if code:
+                seen_codes.add(code)
+            items.extend(items_from_product_info(media, code or "post", username))
+        posts += len(raw)
+        nxt = str(data.get("next_max_id") or "")
+        more = bool(data.get("more_available")) and bool(nxt) and nxt not in seen_cursors
+        if not more:
+            nxt = ""
+        yield ProfilePage(items=items, cursor=nxt, posts=len(raw), more=more)
+        if not more:
+            return
+        if limit and posts >= limit:
+            return
+        seen_cursors.add(nxt)
+        cursor = nxt
+        if delay and delay > 0:
+            time.sleep(delay)
