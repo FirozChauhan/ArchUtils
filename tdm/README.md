@@ -32,6 +32,7 @@ tdm -y --no-browser "https://www.instagram.com/<user>/"  # HTTP path instead (of
 ```
 
 Features: `curl_cffi` TLS/JA3 + HTTP/2 impersonation, Sec-Fetch headers,
-Referer fallback, yt-dlp resolver, Range segmented resume (`.part`+`.part.json`),
+Referer fallback, yt-dlp resolver, Range segmented resume (`.part`+`.part.json`
+records finished byte ranges, so an interrupted run only refetches what is missing),
 exp backoff + `Retry-After`, atomic `os.replace`, disk checks, rich progress,
 XDG config, `notify-send`, JSON output.

@@ -86,6 +86,15 @@ on disk. If the browser shows a login wall, run once with *--headed* and log in;
 the session persists in _~/.local/share/tdm/browser/_. The HTTP path
 (*--no-browser*) keeps its paging cursor in _DEST/@username/.tdm-profile.json_.
 
+# RESUME
+
+Downloads write to _NAME.part_ and record the byte ranges that finished in
+_NAME.part.json_. Re-running the same command resumes only the missing
+ranges, and the ranges stay valid if *-x* changes between runs. A sidecar from
+an older tdm (chunk indices) or one whose ETag/size no longer matches is
+ignored, which costs one full re-download but never produces a bad file.
+Files appear at their final name only after a complete, fsync'd download.
+
 # EXAMPLES
 
 *tdm --dry-run https://speed.hetzner.de/100MB.bin*

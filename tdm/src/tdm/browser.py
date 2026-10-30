@@ -79,7 +79,13 @@ class CDP:
         self._buf = b""
 
     def _write(self, msg: dict) -> None:
-        os.write(self.write_fd, json.dumps(msg).encode() + b"\0")
+        try:
+            os.write(self.write_fd, json.dumps(msg).encode() + b"\0")
+        except (BrokenPipeError, OSError) as e:
+            raise BrowserError(
+                "chromium exited before the download started "
+                "(headed mode needs a graphical session; try without --headed)"
+            ) from e
 
     def _read(self, deadline: float) -> dict:
         while b"\0" not in self._buf:
@@ -91,7 +97,10 @@ class CDP:
                 raise BrowserError("browser did not answer in time")
             chunk = os.read(self.read_fd, 1 << 16)
             if not chunk:
-                raise BrowserError("browser closed the debug pipe")
+                raise BrowserError(
+                    "chromium closed the debug pipe (it exited — headed mode needs a "
+                    "graphical session; try without --headed)"
+                )
             self._buf += chunk
         raw, _, self._buf = self._buf.partition(b"\0")
         return json.loads(raw)
@@ -219,14 +228,28 @@ def collect_profile_posts(username: str, cookies: str = "", limit: int = 0,
         cdp.call("Runtime.enable", session_id=sid)
         if cookies:
             cdp.call("Network.enable", session_id=sid)
-            kept = 0
-            for c in _load_cookies(cookies):
-                try:
-                    cdp.call("Network.setCookie", c, session_id=sid)
-                    kept += 1
-                except BrowserError as e:
-                    LOG.debug("cookie %s rejected: %s", c.get("name"), e)
-            LOG.debug("injected %d cookies", kept)
+            # Only seed the jar into a profile that has no session of its own:
+            # re-injecting a stale sessionid over a live one is what gets a
+            # profile logged out (Instagram treats it as a new device).
+            have_session = False
+            try:
+                jar = cdp.call("Network.getCookies",
+                               {"urls": ["https://www.instagram.com/"]}, session_id=sid)
+                have_session = any(c.get("name") == "sessionid"
+                                   for c in (jar.get("cookies") or []))
+            except BrowserError:
+                pass
+            if have_session:
+                LOG.debug("browser profile already has a session; leaving its cookies alone")
+            else:
+                kept = 0
+                for c in _load_cookies(cookies):
+                    try:
+                        cdp.call("Network.setCookie", c, session_id=sid)
+                        kept += 1
+                    except BrowserError as e:
+                        LOG.debug("cookie %s rejected: %s", c.get("name"), e)
+                LOG.debug("injected %d cookies", kept)
         try:
             cdp.call("Network.setUserAgentOverride",
                      {"userAgent": CHROME_UA, "acceptLanguage": "en-US,en;q=0.9"},
@@ -239,9 +262,19 @@ def collect_profile_posts(username: str, cookies: str = "", limit: int = 0,
 
         codes = _wait_for_grid(cdp, sid, wait, log)
         if not codes:
+            where = cdp.eval("location.pathname", sid) or "?"
+            if not where.startswith(f"/{username}"):
+                raise BrowserError(
+                    f"@{username}: Instagram sent the browser to {where} instead of the profile —\n"
+                    "the stored session is no longer accepted (that page is the profile picker).\n"
+                    "Fix it either way:\n"
+                    "  tdm cookies ~/cookies.txt     (re-export while logged in)\n"
+                    "  tdm --headed <profile-url>    (log in once in the window that opens)\n"
+                    f"The browser session lives in {browser_profile_dir()}."
+                )
             if cdp.eval(LOGIN_JS, sid):
                 raise BrowserError(
-                    "Instagram shows the logged-in wall in the browser. Run once with\n"
+                    "Instagram shows a login wall in the browser. Run once with\n"
                     "  tdm --headed <profile-url>\n"
                     "and log in in the window that opens (the session is kept in\n"
                     f"  {browser_profile_dir()}\n"

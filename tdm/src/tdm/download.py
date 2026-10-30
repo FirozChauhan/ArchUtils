@@ -42,6 +42,58 @@ class DownloadError(RuntimeError):
     pass
 
 
+def _merge_ranges(ranges) -> list[list[int]]:
+    """Sort and coalesce inclusive [start, end] pairs."""
+    out: list[list[int]] = []
+    for s, e in sorted((int(a), int(b)) for a, b in ranges):
+        if out and s <= out[-1][1] + 1:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return out
+
+
+def _missing_ranges(total: int, done: list[list[int]]) -> list[tuple[int, int]]:
+    """Complement of `done` inside [0, total-1]."""
+    gaps: list[tuple[int, int]] = []
+    pos = 0
+    for s, e in done:
+        if s > pos:
+            gaps.append((pos, s - 1))
+        pos = max(pos, e + 1)
+        if pos >= total:
+            return gaps
+    if pos < total:
+        gaps.append((pos, total - 1))
+    return gaps
+
+
+def _plan_chunks(gaps: list[tuple[int, int]], connections: int,
+                 min_split: int) -> list[tuple[int, int]]:
+    """Split the still-missing ranges into ~`connections` pieces.
+
+    Pieces are never smaller than `min_split`, so resuming a nearly finished
+    file does not open one socket per leftover megabyte.
+    """
+    if not gaps:
+        return []
+    left = max(1, connections)
+    min_split = max(int(min_split or 0), 1)
+    chunks: list[tuple[int, int]] = []
+    for s, e in gaps:
+        size = e - s + 1
+        n = 1
+        if left > 1 and size >= 2 * min_split:
+            n = min(left, max(1, size // min_split))
+        step = size // n
+        for i in range(n):
+            cs = s + i * step
+            ce = (cs + step - 1) if i < n - 1 else e
+            chunks.append((cs, ce))
+        left = max(0, left - n)
+    return chunks
+
+
 def _sleep_backoff(attempt: int, base: float, resp=None) -> None:
     if resp is not None and resp.status_code == 429:
         wait = parse_retry_after(resp.headers.get("Retry-After"), base * (2**attempt))
@@ -109,8 +161,9 @@ def _fetch_range(args) -> tuple[int, int, str | None]:
                 _sleep_backoff(attempt, base, None)
                 err = f"HTTP {r.status_code}"
                 continue
-            # server ignored Range -> only chunk 0 may accept 200
-            if r.status_code == 200 and (end >= 0 and idx != 0):
+            # server ignored Range -> a 200 body is the WHOLE file and must
+            # never be written at a non-zero offset
+            if r.status_code == 200 and start != 0:
                 return idx, 0, "server ignored Range (no resume)"
             off = start
             with open(file_path, "r+b") as f:
@@ -185,20 +238,33 @@ def segmented_download(
         connections_eff = max(1, min(connections, max_by_size))
         connections_eff = min(connections_eff, 16)
 
-    check_disk(dest, total)
-
-    # resume: validate sidecar
-    done_ranges: set[int] = set()
+    # Resume state stores COMPLETED BYTE RANGES, not chunk indices: chunk
+    # boundaries move when -x changes, ranges do not. Old sidecars (index
+    # lists) are ignored, which just means one full re-download.
+    done: list[list[int]] = []
     st = _load_state(state)
-    if st and part.exists() and st.get("final_url") and st.get("total") == total and total > 0:
-        if st.get("etag", "") == etag:
-            done_ranges = set(st.get("done", []))
+    if (st and part.exists() and total > 0 and st.get("v") == 2
+            and st.get("total") == total and st.get("etag", "") == etag):
+        try:
+            done = _merge_ranges(
+                (int(a), int(b)) for a, b in st.get("done", []) if int(b) >= int(a)
+            )
+        except (TypeError, ValueError):
+            done = []
+        done = [[max(0, a), min(b, total - 1)] for a, b in done if a <= total - 1]
     elif part.exists() and total == 0:
-        pass  # unknown size: restart single-stream below (keep .part? no, restart)
+        # unknown size: a partial file is unusable, restart single-stream
         try:
             part.unlink()
         except OSError:
             pass
+
+    if total <= 0 or not resumable:
+        done = []  # byte ranges mean nothing when the server will not serve them
+
+    # Only the missing bytes need room; a resumed 8 GB download with 7.9 GB on
+    # disk must not be refused for want of 8 GB of free space.
+    check_disk(dest, total - sum(e - s + 1 for s, e in done) if total > 0 else 0)
 
     # open / preallocate
     mode = "r+b" if part.exists() else "w+b"
@@ -207,23 +273,16 @@ def segmented_download(
             try:
                 if f.tell() != total:
                     try_preallocate(f.fileno(), total)
+                if part.stat().st_size > total:  # never trust a stale bigger part
+                    os.ftruncate(f.fileno(), total)
             except OSError as e:
                 raise DownloadError(f"preallocate failed: {e}") from e
 
-    # build chunk list
-    chunks: list[tuple[int, int]] = []
-    if connections_eff == 1 or total <= 0:
+    # build chunk list from what is still missing
+    if total <= 0:
         chunks = [(0, -1)]
     else:
-        size = total // connections_eff
-        for i in range(connections_eff):
-            s = i * size
-            e = (s + size - 1) if i < connections_eff - 1 else (total - 1)
-            if i in done_ranges:
-                continue
-            chunks.append((s, e))
-        if not chunks:  # all done per sidecar but file maybe complete
-            chunks = []
+        chunks = _plan_chunks(_missing_ranges(total, done), connections_eff, min_split_n)
 
     rate_per_conn = (rate_total // connections_eff) if rate_total and connections_eff else 0
     written = [0]
@@ -244,13 +303,9 @@ def segmented_download(
         )
         task = prog.add_task("dl", name=dest.name[:30], total=total or None)
         prog.start()
-        # account already-written bytes
-        if part.exists() and total > 0:
-            have = part.stat().st_size if connections_eff == 1 else None
-            # for segmented, completed chunks unknown precisely; use sidecar count
-            if done_ranges:
-                approx = len(done_ranges) * (total // connections_eff)
-                prog.update(task, completed=min(approx, total))
+        # account for bytes a previous run already fetched
+        if total > 0 and done:
+            prog.update(task, completed=min(sum(e - s + 1 for s, e in done), total))
 
     def _cb(n: int):
         written[0] += n
@@ -284,15 +339,15 @@ def segmented_download(
             futs = {
                 ex.submit(
                     _fetch_range, (i, s, e, url, page_url, part, kw)
-                ): (i, s, e)
+                ): (s, e)
                 for i, (s, e) in enumerate(chunks)
             }
-            idx_map = {id(f): se for f, se in zip(futs.keys(), chunks)}
             for fut in as_completed(futs):
+                start, end = futs[fut]
                 idx, nbytes, err = fut.result()
                 if err:
                     # single-stream fallback: server ignored Range
-                    if "ignored Range" in err and connections_eff > 1:
+                    if "ignored Range" in err:
                         for f in futs:
                             f.cancel()
                         if prog:
@@ -309,24 +364,25 @@ def segmented_download(
                             1, min_split, limit_rate, 0, False, etag,
                             progress_mode, quiet,
                         )
-                    errors.append(f"chunk {idx}: {err}")
-                else:
-                    if total > 0 and connections_eff > 1:
-                        # mark chunk idx done (map worker idx -> global chunk idx)
-                        pass
-            # persist done state (simplified: store completed count)
-            if total > 0:
-                _save_state(
-                    state,
-                    {"final_url": url, "total": total, "etag": etag,
-                     "done": sorted(done_ranges), "ts": time.time()},
-                )
+                    errors.append(f"chunk {start}-{end}: {err}")
+                elif total > 0 and end >= 0:
+                    # Persist each finished range immediately: a crash later in
+                    # the run must not cost the chunks that already landed.
+                    with lock:
+                        done.append([start, end])
+                        merged = _merge_ranges(done)
+                        done[:] = merged
+                        _save_state(
+                            state,
+                            {"v": 2, "final_url": url, "total": total, "etag": etag,
+                             "done": merged, "ts": time.time()},
+                        )
     if prog:
         prog.stop()
 
     if _cancel.is_set():
-        _save_state(state, {"final_url": url, "total": total, "etag": etag,
-                            "done": sorted(done_ranges), "ts": time.time()})
+        _save_state(state, {"v": 2, "final_url": url, "total": total, "etag": etag,
+                            "done": _merge_ranges(done), "ts": time.time()})
         raise DownloadError("cancelled — progress kept in .part (re-run to resume)")
 
     if errors:
